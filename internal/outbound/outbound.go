@@ -27,6 +27,11 @@ type Manager struct {
 	groups map[string]*Group
 }
 
+// IManager exposes the subset of outbound manager behaviour required by consumers.
+type IManager interface {
+	Get(tag string) (IDnsOutbound, bool)
+}
+
 // Group is an outbound group containing multiple resolvers.
 type Group struct {
 	tag       string
@@ -53,9 +58,12 @@ func NewManager(cfg []config.OutboundConfig) (*Manager, error) {
 }
 
 // Get retrieves a configured outbound group.
-func (m *Manager) Get(tag string) (*Group, bool) {
+func (m *Manager) Get(tag string) (IDnsOutbound, bool) {
 	group, ok := m.groups[tag]
-	return group, ok
+	if !ok {
+		return nil, false
+	}
+	return group, true
 }
 
 var randMutex sync.Mutex // ensure rand usage is goroutine-safe

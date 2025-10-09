@@ -11,51 +11,131 @@ import (
 	"go.uber.org/zap"
 
 	"atlas/internal/cache"
-	"atlas/internal/config"
 	"atlas/internal/outbound"
 	"atlas/internal/routing"
 )
 
-// Server handles inbound DNS requests.
-type Server struct {
-	addr         string
+// Cache abstracts cache operations used by the server.
+type Cache interface {
+	Get(key string) (cache.Result, bool)
+	Set(key string, msg *dns.Msg)
+	MarkRefreshComplete(key string)
+}
+
+// OutboundManager describes the behaviour required from an outbound manager.
+type OutboundManager interface {
+	Get(tag string) (outbound.IDnsOutbound, bool)
+}
+
+// Server exposes the DNS server behaviour.
+type Server interface {
+	Start(ctx context.Context) error
+}
+
+// Option configures the DNS server.
+type Option func(*options)
+
+type options struct {
+	bind    string
+	timeout time.Duration
+	manager OutboundManager
+	routes  []routing.IRouteRule
+	cache   Cache
+}
+
+// WithBind configures the bind address.
+func WithBind(bind string) Option {
+	return func(o *options) {
+		if strings.TrimSpace(bind) != "" {
+			o.bind = bind
+		}
+	}
+}
+
+// WithTimeout overrides the request timeout.
+func WithTimeout(t time.Duration) Option {
+	return func(o *options) {
+		if t > 0 {
+			o.timeout = t
+		}
+	}
+}
+
+// WithOutboundManager provides the outbound manager implementation.
+func WithOutboundManager(m OutboundManager) Option {
+	return func(o *options) {
+		o.manager = m
+	}
+}
+
+// WithRoutes supplies routing rules.
+func WithRoutes(routes []routing.IRouteRule) Option {
+	return func(o *options) {
+		o.routes = append([]routing.IRouteRule(nil), routes...)
+	}
+}
+
+// WithCache sets the cache implementation.
+func WithCache(c Cache) Option {
+	return func(o *options) {
+		o.cache = c
+	}
+}
+
+type dnsServer struct {
+	bind         string
 	udpServer    *dns.Server
 	tcpServer    *dns.Server
-	outbounds    *outbound.Manager
+	outbounds    OutboundManager
 	routes       []routing.IRouteRule
-	cache        *cache.Cache
+	cache        Cache
 	cacheEnabled bool
 	timeout      time.Duration
 }
 
 // New creates a DNS forwarder server using the supplied configuration.
-func New(cfg *config.Config, outbounds *outbound.Manager, routes []routing.IRouteRule,
-	responseCache *cache.Cache) *Server {
-	s := &Server{
-		addr:         cfg.Bind,
-		outbounds:    outbounds,
-		routes:       routes,
-		cache:        responseCache,
-		cacheEnabled: responseCache != nil,
-		timeout:      6 * time.Second,
+func New(opts ...Option) (Server, error) {
+	cfg := options{
+		bind:    ":5353",
+		timeout: 6 * time.Second,
 	}
-	return s
+	for _, opt := range opts {
+		if opt != nil {
+			opt(&cfg)
+		}
+	}
+	if cfg.manager == nil {
+		return nil, fmt.Errorf("outbound manager is required")
+	}
+	if len(cfg.routes) == 0 {
+		return nil, fmt.Errorf("routing rules are required")
+	}
+
+	s := &dnsServer{
+		bind:         cfg.bind,
+		outbounds:    cfg.manager,
+		routes:       cfg.routes,
+		cache:        cfg.cache,
+		cacheEnabled: cfg.cache != nil,
+		timeout:      cfg.timeout,
+	}
+	return s, nil
 }
 
 // Start begins listening on both UDP and TCP.
-func (s *Server) Start(ctx context.Context) error {
+func (s *dnsServer) Start(ctx context.Context) error {
 	if s.outbounds == nil {
 		return fmt.Errorf("outbound manager not initialised")
 	}
 	s.udpServer = &dns.Server{
-		Addr: s.addr,
+		Addr: s.bind,
 		Net:  "udp",
 		Handler: dns.HandlerFunc(func(w dns.ResponseWriter, req *dns.Msg) {
 			s.handleDNS(ctx, w, req)
 		}),
 	}
 	s.tcpServer = &dns.Server{
-		Addr: s.addr,
+		Addr: s.bind,
 		Net:  "tcp",
 		Handler: dns.HandlerFunc(func(w dns.ResponseWriter, req *dns.Msg) {
 			s.handleDNS(ctx, w, req)
@@ -79,12 +159,12 @@ func (s *Server) Start(ctx context.Context) error {
 	}
 }
 
-func (s *Server) shutdown() {
+func (s *dnsServer) shutdown() {
 	_ = s.udpServer.Shutdown()
 	_ = s.tcpServer.Shutdown()
 }
 
-func (s *Server) handleDNS(ctx context.Context, w dns.ResponseWriter, req *dns.Msg) {
+func (s *dnsServer) handleDNS(ctx context.Context, w dns.ResponseWriter, req *dns.Msg) {
 	log := logutil.GetLogger(ctx)
 	defer func() {
 		if r := recover(); r != nil {
@@ -110,7 +190,7 @@ func (s *Server) handleDNS(ctx context.Context, w dns.ResponseWriter, req *dns.M
 	log.Debug("response sent to client", zap.String("question", questionName(resp)))
 }
 
-func (s *Server) processRequest(ctx context.Context, req *dns.Msg) *dns.Msg {
+func (s *dnsServer) processRequest(ctx context.Context, req *dns.Msg) *dns.Msg {
 	if req == nil {
 		return nil
 	}
@@ -181,7 +261,7 @@ func (s *Server) processRequest(ctx context.Context, req *dns.Msg) *dns.Msg {
 	return nil
 }
 
-func (s *Server) refresh(ctx context.Context, key string, req *dns.Msg, group outbound.IDnsOutbound) {
+func (s *dnsServer) refresh(ctx context.Context, key string, req *dns.Msg, group outbound.IDnsOutbound) {
 	if s.cache == nil {
 		return
 	}

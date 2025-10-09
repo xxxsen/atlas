@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 	"flag"
-	"log"
+	"fmt"
 	"os"
 	"os/signal"
 	"syscall"
@@ -25,7 +25,9 @@ func main() {
 
 	cfg, err := config.Load(*cfgPath)
 	if err != nil {
-		log.Fatalf("load config failed, err:%v", err)
+		// logger not initialised yet, fallback to stderr
+		fmt.Fprintf(os.Stderr, "load config failed: %v\n", err)
+		os.Exit(1)
 	}
 	logkit := logger.Init(cfg.Log.File, cfg.Log.Level, int(cfg.Log.FileCount),
 		int(cfg.Log.FileSize), int(cfg.Log.KeepDays), cfg.Log.Console)
@@ -46,7 +48,19 @@ func main() {
 		responseCache = cache.New(cfg.Cache.Size, cfg.Cache.Lazy)
 	}
 
-	forwarder := server.New(cfg, outboundManager, rules, responseCache)
+	serverOpts := []server.Option{
+		server.WithBind(cfg.Bind),
+		server.WithOutboundManager(outboundManager),
+		server.WithRoutes(rules),
+	}
+	if responseCache != nil {
+		serverOpts = append(serverOpts, server.WithCache(responseCache))
+	}
+
+	forwarder, err := server.New(serverOpts...)
+	if err != nil {
+		logkit.Fatal("initialise server failed", zap.Error(err))
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
