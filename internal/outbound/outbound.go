@@ -36,10 +36,10 @@ type IManager interface {
 type Group struct {
 	tag       string
 	parallel  int
-	resolvers []resolver
+	resolvers []IDNSResolver
 }
 
-type resolver interface {
+type IDNSResolver interface {
 	String() string
 	Query(ctx context.Context, req *dns.Msg) (*dns.Msg, error)
 }
@@ -126,7 +126,7 @@ func (g *Group) Query(ctx context.Context, req *dns.Msg) (*dns.Msg, error) {
 	return nil, firstErr
 }
 
-func (g *Group) pickResolvers() []resolver {
+func (g *Group) pickResolvers() []IDNSResolver {
 	count := g.parallel
 	if count > len(g.resolvers) {
 		count = len(g.resolvers)
@@ -140,7 +140,7 @@ func (g *Group) pickResolvers() []resolver {
 		indexes[i], indexes[j] = indexes[j], indexes[i]
 	})
 	randMutex.Unlock()
-	selected := make([]resolver, 0, count)
+	selected := make([]IDNSResolver, 0, count)
 	for i := 0; i < count; i++ {
 		selected = append(selected, g.resolvers[indexes[i]])
 	}
@@ -148,7 +148,7 @@ func (g *Group) pickResolvers() []resolver {
 }
 
 func buildGroup(cfg config.OutboundConfig) (*Group, error) {
-	resolvers := make([]resolver, 0, len(cfg.ServerList))
+	resolvers := make([]IDNSResolver, 0, len(cfg.ServerList))
 	for _, raw := range cfg.ServerList {
 		resolver, err := buildResolver(strings.TrimSpace(raw))
 		if err != nil {
@@ -163,7 +163,7 @@ func buildGroup(cfg config.OutboundConfig) (*Group, error) {
 	}, nil
 }
 
-func buildResolver(raw string) (resolver, error) {
+func buildResolver(raw string) (IDNSResolver, error) {
 	if raw == "" {
 		return nil, errors.New("empty server endpoint")
 	}

@@ -20,7 +20,7 @@ type dohResolver struct {
 	client   *http.Client
 }
 
-func newDoHResolver(u *url.URL) (resolver, error) {
+func newDoHResolver(u *url.URL) (IDNSResolver, error) {
 	if u == nil {
 		return nil, fmt.Errorf("nil url")
 	}

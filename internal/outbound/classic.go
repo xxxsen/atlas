@@ -19,7 +19,7 @@ type classicResolver struct {
 	client *dns.Client
 }
 
-func newClassicResolver(u *url.URL) (resolver, error) {
+func newClassicResolver(u *url.URL) (IDNSResolver, error) {
 	if u == nil {
 		return nil, fmt.Errorf("nil url")
 	}

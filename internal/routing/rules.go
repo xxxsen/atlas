@@ -51,7 +51,7 @@ func BuildRules(cfg []config.RouteConfig) ([]IRouteRule, error) {
 
 type domainRule struct {
 	tag      string
-	matchers []domainMatcher
+	matchers []IDomainMatcher
 }
 
 func newDomainRule(tag string, patterns []string) (*domainRule, error) {
@@ -61,7 +61,7 @@ func newDomainRule(tag string, patterns []string) (*domainRule, error) {
 	if len(patterns) == 0 {
 		return nil, fmt.Errorf("domain rule requires domain_list entries")
 	}
-	matchers := make([]domainMatcher, 0, len(patterns))
+	matchers := make([]IDomainMatcher, 0, len(patterns))
 	for _, raw := range patterns {
 		raw = strings.TrimSpace(raw)
 		if raw == "" {
@@ -95,7 +95,7 @@ func (r *domainRule) Match(question dns.Question) (*RouteDecision, bool) {
 	return nil, false
 }
 
-type domainMatcher interface {
+type IDomainMatcher interface {
 	Match(name string) bool
 }
 
@@ -126,7 +126,7 @@ func (m regexpMatcher) Match(name string) bool {
 	return m.expr.MatchString(name)
 }
 
-func parseDomainMatcher(raw string) (domainMatcher, error) {
+func parseDomainMatcher(raw string) (IDomainMatcher, error) {
 	parts := strings.SplitN(raw, ":", 2)
 	if len(parts) == 1 {
 		return suffixMatcher{suffix: normalizeDomain(raw)}, nil
