@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"github.com/miekg/dns"
+	"github.com/xxxsen/common/logutil"
+	"go.uber.org/zap"
 
 	"atlas/internal/config"
 )
@@ -65,6 +67,13 @@ func (g *Group) Query(ctx context.Context, req *dns.Msg) (*dns.Msg, error) {
 	}
 
 	choices := g.pickResolvers()
+	logger := logutil.GetLogger(ctx).With(
+		zap.String("outbound_tag", g.tag),
+		zap.Int("available_resolvers", len(g.resolvers)),
+		zap.Int("parallel", len(choices)),
+		zap.String("question", questionName(req)),
+	)
+	logger.Debug("outbound group dispatching query")
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -80,9 +89,12 @@ func (g *Group) Query(ctx context.Context, req *dns.Msg) (*dns.Msg, error) {
 		go func() {
 			msg, err := resolver.Query(ctx, cloneMessage(req))
 			if err == nil && msg != nil {
+				logger.Debug("resolver succeeded", zap.String("resolver", resolver.String()))
 				once.Do(func() {
 					cancel()
 				})
+			} else if err != nil {
+				logger.Warn("resolver failed", zap.String("resolver", resolver.String()), zap.Error(err))
 			}
 			respCh <- response{msg: msg, err: err}
 		}()
@@ -92,6 +104,7 @@ func (g *Group) Query(ctx context.Context, req *dns.Msg) (*dns.Msg, error) {
 	for range choices {
 		resp := <-respCh
 		if resp.err == nil && resp.msg != nil {
+			logger.Debug("returning fastest resolver response")
 			return resp.msg, nil
 		}
 		if firstErr == nil {
@@ -101,6 +114,7 @@ func (g *Group) Query(ctx context.Context, req *dns.Msg) (*dns.Msg, error) {
 	if firstErr == nil {
 		firstErr = errors.New("all outbound resolvers failed")
 	}
+	logger.Error("all resolvers failed", zap.Error(firstErr))
 	return nil, firstErr
 }
 
@@ -174,4 +188,11 @@ func cloneMessage(msg *dns.Msg) *dns.Msg {
 
 func init() {
 	rand.Seed(time.Now().UnixNano())
+}
+
+func questionName(msg *dns.Msg) string {
+	if msg == nil || len(msg.Question) == 0 {
+		return ""
+	}
+	return strings.TrimSuffix(msg.Question[0].Name, ".")
 }

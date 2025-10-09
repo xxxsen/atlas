@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"github.com/miekg/dns"
+	"github.com/xxxsen/common/logutil"
+	"go.uber.org/zap"
 )
 
 type classicResolver struct {
@@ -65,7 +67,15 @@ func (r *classicResolver) Query(ctx context.Context, req *dns.Msg) (*dns.Msg, er
 	if r == nil || r.client == nil {
 		return nil, fmt.Errorf("resolver not initialised")
 	}
-	return exchangeContext(ctx, r.client, req, r.addr)
+	log := logutil.GetLogger(ctx).With(zap.String("resolver", r.String()))
+	log.Debug("sending classic dns query", zap.String("question", questionName(req)))
+	resp, err := exchangeContext(ctx, r.client, req, r.addr)
+	if err != nil {
+		log.Warn("classic dns query failed", zap.Error(err))
+		return nil, err
+	}
+	log.Debug("classic dns query succeeded")
+	return resp, nil
 }
 
 func hasPort(host string) bool {

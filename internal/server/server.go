@@ -107,6 +107,7 @@ func (s *Server) handleDNS(ctx context.Context, w dns.ResponseWriter, req *dns.M
 	if err := w.WriteMsg(resp); err != nil {
 		log.Error("write response failed", zap.Error(err))
 	}
+	log.Debug("response sent to client", zap.String("question", questionName(resp)))
 }
 
 func (s *Server) processRequest(ctx context.Context, req *dns.Msg) *dns.Msg {
@@ -121,6 +122,7 @@ func (s *Server) processRequest(ctx context.Context, req *dns.Msg) *dns.Msg {
 	question := req.Question[0]
 	key := cacheKey(question)
 	log := logutil.GetLogger(ctx)
+	log.Debug("processing dns question", zap.String("question", questionName(req)))
 
 	for _, rule := range s.routes {
 		decision, ok := rule.Match(question)
@@ -131,6 +133,7 @@ func (s *Server) processRequest(ctx context.Context, req *dns.Msg) *dns.Msg {
 			reply := new(dns.Msg)
 			reply.SetReply(req)
 			reply.Answer = append(reply.Answer, cloneRecords(decision.Records)...)
+			log.Info("served response from static records", zap.String("question", questionName(req)), zap.Int("answer_count", len(reply.Answer)))
 			return reply
 		}
 		if decision.OutboundTag == "" {
@@ -141,17 +144,21 @@ func (s *Server) processRequest(ctx context.Context, req *dns.Msg) *dns.Msg {
 			log.Warn("no outbound found for tag", zap.String("tag", decision.OutboundTag))
 			continue
 		}
+		log.Debug("route matched outbound", zap.String("tag", decision.OutboundTag), zap.String("question", questionName(req)))
 
 		// Cache lookup
 		if s.cacheEnabled && decision.Cacheable {
 			if res, found := s.cache.Get(key); found && res.Msg != nil {
 				reply := res.Msg.Copy()
 				reply.Question = req.Question
+				log.Debug("cache hit for question", zap.String("question", questionName(req)), zap.Bool("stale", res.Expired))
 				if res.ShouldRefresh {
+					log.Debug("scheduling cache refresh", zap.String("question", questionName(req)))
 					go s.refresh(ctx, key, req, group)
 				}
 				return reply
 			}
+			log.Debug("cache miss for question", zap.String("question", questionName(req)))
 		}
 
 		ctxTimeout, cancel := context.WithTimeout(ctx, s.timeout)
@@ -164,10 +171,13 @@ func (s *Server) processRequest(ctx context.Context, req *dns.Msg) *dns.Msg {
 		resp.Question = req.Question
 		if s.cacheEnabled && decision.Cacheable {
 			s.cache.Set(key, resp)
+			log.Debug("cached outbound response", zap.String("question", questionName(req)))
 		}
+		log.Info("forwarded response from outbound", zap.String("tag", decision.OutboundTag), zap.String("question", questionName(req)))
 		return resp
 	}
 
+	log.Warn("no routing rule matched question", zap.String("question", questionName(req)))
 	return nil
 }
 
@@ -185,6 +195,7 @@ func (s *Server) refresh(ctx context.Context, key string, req *dns.Msg, group ou
 	}
 	resp.Question = req.Question
 	s.cache.Set(key, resp)
+	logutil.GetLogger(ctx).Debug("cache refreshed", zap.String("question", questionName(req)))
 }
 
 func cloneRecords(records []dns.RR) []dns.RR {
@@ -211,4 +222,11 @@ func cloneRequest(req *dns.Msg) *dns.Msg {
 func cacheKey(question dns.Question) string {
 	name := strings.ToLower(strings.TrimSuffix(question.Name, "."))
 	return fmt.Sprintf("%s:%d:%d", name, question.Qtype, question.Qclass)
+}
+
+func questionName(msg *dns.Msg) string {
+	if msg == nil || len(msg.Question) == 0 {
+		return ""
+	}
+	return strings.TrimSuffix(msg.Question[0].Name, ".")
 }

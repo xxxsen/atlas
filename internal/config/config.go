@@ -9,6 +9,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/xxxsen/common/logger"
 )
 
 // Config is the root runtime configuration.
@@ -17,6 +19,7 @@ type Config struct {
 	Outbounds []OutboundConfig `json:"outbound"`
 	Routes    []RouteConfig    `json:"route"`
 	Cache     CacheConfig      `json:"cache"`
+	Log       logger.LogConfig `json:"log"`
 }
 
 // OutboundConfig defines an outbound resolver group.
