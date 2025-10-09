@@ -26,11 +26,11 @@ type Server struct {
 	cache        *cache.Cache
 	cacheEnabled bool
 	timeout      time.Duration
-	baseCtx      context.Context
 }
 
 // New creates a DNS forwarder server using the supplied configuration.
-func New(cfg *config.Config, outbounds *outbound.Manager, routes []routing.IRouteRule, responseCache *cache.Cache) *Server {
+func New(cfg *config.Config, outbounds *outbound.Manager, routes []routing.IRouteRule,
+	responseCache *cache.Cache) *Server {
 	s := &Server{
 		addr:         cfg.Bind,
 		outbounds:    outbounds,
@@ -38,17 +38,6 @@ func New(cfg *config.Config, outbounds *outbound.Manager, routes []routing.IRout
 		cache:        responseCache,
 		cacheEnabled: responseCache != nil,
 		timeout:      6 * time.Second,
-		baseCtx:      context.Background(),
-	}
-	s.udpServer = &dns.Server{
-		Addr:    cfg.Bind,
-		Net:     "udp",
-		Handler: dns.HandlerFunc(s.handleDNS),
-	}
-	s.tcpServer = &dns.Server{
-		Addr:    cfg.Bind,
-		Net:     "tcp",
-		Handler: dns.HandlerFunc(s.handleDNS),
 	}
 	return s
 }
@@ -58,11 +47,22 @@ func (s *Server) Start(ctx context.Context) error {
 	if s.outbounds == nil {
 		return fmt.Errorf("outbound manager not initialised")
 	}
-	errCh := make(chan error, 2)
-	if ctx == nil {
-		ctx = context.Background()
+	s.udpServer = &dns.Server{
+		Addr: s.addr,
+		Net:  "udp",
+		Handler: dns.HandlerFunc(func(w dns.ResponseWriter, req *dns.Msg) {
+			s.handleDNS(ctx, w, req)
+		}),
 	}
-	s.baseCtx = ctx
+	s.tcpServer = &dns.Server{
+		Addr: s.addr,
+		Net:  "tcp",
+		Handler: dns.HandlerFunc(func(w dns.ResponseWriter, req *dns.Msg) {
+			s.handleDNS(ctx, w, req)
+		}),
+	}
+
+	errCh := make(chan error, 2)
 	go func() {
 		errCh <- s.udpServer.ListenAndServe()
 	}()
@@ -84,8 +84,7 @@ func (s *Server) shutdown() {
 	_ = s.tcpServer.Shutdown()
 }
 
-func (s *Server) handleDNS(w dns.ResponseWriter, req *dns.Msg) {
-	ctx := s.baseCtx
+func (s *Server) handleDNS(ctx context.Context, w dns.ResponseWriter, req *dns.Msg) {
 	log := logutil.GetLogger(ctx)
 	defer func() {
 		if r := recover(); r != nil {
@@ -98,7 +97,7 @@ func (s *Server) handleDNS(w dns.ResponseWriter, req *dns.Msg) {
 		resp = new(dns.Msg)
 		resp.SetRcode(req, dns.RcodeServerFailure)
 	}
-	if resp.Question == nil || len(resp.Question) == 0 {
+	if len(resp.Question) == 0 {
 		resp.Question = req.Question
 	}
 	resp.Id = req.Id
