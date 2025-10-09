@@ -12,6 +12,7 @@ import (
 	"atlas/internal/cache"
 	"atlas/internal/config"
 	"atlas/internal/outbound"
+	"atlas/internal/provider"
 	"atlas/internal/routing"
 	"atlas/internal/server"
 
@@ -38,7 +39,12 @@ func main() {
 		logkit.Fatal("initialise outbounds failed", zap.Error(err))
 	}
 
-	rules, err := routing.BuildRules(cfg.Routes)
+	providers, err := provider.LoadProviders(cfg.DataProviders)
+	if err != nil {
+		logkit.Fatal("load data providers failed", zap.Error(err))
+	}
+
+	rules, err := routing.BuildRules(cfg.Routes, providers)
 	if err != nil {
 		logkit.Fatal("initialise routing rules failed", zap.Error(err))
 	}

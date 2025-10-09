@@ -1,16 +1,15 @@
 package routing
 
 import (
-	"bufio"
 	"fmt"
 	"net"
-	"os"
 	"regexp"
 	"strings"
 
 	"github.com/miekg/dns"
 
 	"atlas/internal/config"
+	providerpkg "atlas/internal/provider"
 )
 
 // RouteDecision captures the outcome of a routing decision.
@@ -26,70 +25,90 @@ type IRouteRule interface {
 }
 
 // BuildRules builds routing rules based on configuration order.
-func BuildRules(cfg []config.RouteConfig) ([]IRouteRule, error) {
+func BuildRules(cfg []config.RouteConfig, providers map[string]*providerpkg.ProviderData) ([]IRouteRule, error) {
 	rules := make([]IRouteRule, 0, len(cfg))
 	for _, item := range cfg {
-		switch strings.ToLower(item.Type) {
-		case "domain":
-			rule, err := newDomainRule(item.OutboundTag, item.DomainList)
-			if err != nil {
-				return nil, fmt.Errorf("domain rule: %w", err)
+		matchers := make([]IDomainMatcher, 0)
+		hostRecords := make(map[string][]net.IP)
+		for _, key := range item.DataKeyList {
+			provider, ok := providers[key]
+			if !ok {
+				return nil, fmt.Errorf("route references unknown data_key %q", key)
 			}
-			rules = append(rules, rule)
-		case "host":
-			rule, err := newHostRule(item.OutboundTag, item.File)
-			if err != nil {
-				return nil, fmt.Errorf("host rule: %w", err)
+			switch provider.Kind {
+			case providerpkg.KindDomainFile:
+				for _, rule := range provider.DomainRules {
+					matcher, err := ParseDomainMatcher(rule)
+					if err != nil {
+						return nil, fmt.Errorf("parse domain rule from data_key %q: %w", key, err)
+					}
+					matchers = append(matchers, matcher)
+				}
+			case providerpkg.KindHost:
+				for domain, ips := range provider.HostRecords {
+					existing := hostRecords[domain]
+					hostRecords[domain] = append(existing, ips...)
+				}
+			default:
+				return nil, fmt.Errorf("unsupported provider kind %q for data_key %s", provider.Kind, key)
 			}
-			rules = append(rules, rule)
-		default:
-			return nil, fmt.Errorf("unsupported rule type %q", item.Type)
 		}
+		rule, err := newRouteRule(item.OutboundTag, matchers, hostRecords)
+		if err != nil {
+			return nil, err
+		}
+		rules = append(rules, rule)
 	}
 	return rules, nil
 }
 
-type domainRule struct {
-	tag      string
-	matchers []IDomainMatcher
+type routeRule struct {
+	tag            string
+	domainMatchers []IDomainMatcher
+	hostRecords    map[string][]net.IP
 }
 
-func newDomainRule(tag string, patterns []string) (*domainRule, error) {
-	if tag == "" {
-		return nil, fmt.Errorf("domain rule requires outbound tag")
+func newRouteRule(tag string, matchers []IDomainMatcher, hosts map[string][]net.IP) (*routeRule, error) {
+	if len(matchers) == 0 && len(hosts) == 0 {
+		return nil, fmt.Errorf("route requires domain or host data")
 	}
-	if len(patterns) == 0 {
-		return nil, fmt.Errorf("domain rule requires domain_list entries")
+	if len(matchers) > 0 && strings.TrimSpace(tag) == "" {
+		return nil, fmt.Errorf("route with domain data requires outbound tag")
 	}
-	matchers := make([]IDomainMatcher, 0, len(patterns))
-	for _, raw := range patterns {
-		raw = strings.TrimSpace(raw)
-		if raw == "" {
-			continue
-		}
-		matcher, err := parseDomainMatcher(raw)
-		if err != nil {
-			return nil, err
-		}
-		matchers = append(matchers, matcher)
-	}
-	if len(matchers) == 0 {
-		return nil, fmt.Errorf("domain rule has no valid matchers")
-	}
-	return &domainRule{
-		tag:      tag,
-		matchers: matchers,
+	return &routeRule{
+		tag:            tag,
+		domainMatchers: matchers,
+		hostRecords:    hosts,
 	}, nil
 }
 
-func (r *domainRule) Match(question dns.Question) (*RouteDecision, bool) {
-	name := normalizeDomain(question.Name)
-	for _, matcher := range r.matchers {
-		if matcher.Match(name) {
+func (r *routeRule) Match(question dns.Question) (*RouteDecision, bool) {
+	name := NormalizeDomain(question.Name)
+	if len(r.hostRecords) > 0 {
+		if ips, ok := r.hostRecords[name]; ok && len(ips) > 0 {
+			answers := buildHostRecords(question, ips)
+			if len(answers) > 0 {
+				return &RouteDecision{
+					Records:   answers,
+					Cacheable: false,
+				}, true
+			}
+		}
+		if len(r.domainMatchers) == 0 && strings.TrimSpace(r.tag) != "" {
 			return &RouteDecision{
 				OutboundTag: r.tag,
 				Cacheable:   true,
 			}, true
+		}
+	}
+	if len(r.domainMatchers) > 0 {
+		for _, matcher := range r.domainMatchers {
+			if matcher.Match(name) {
+				return &RouteDecision{
+					OutboundTag: r.tag,
+					Cacheable:   true,
+				}, true
+			}
 		}
 	}
 	return nil, false
@@ -126,14 +145,14 @@ func (m regexpMatcher) Match(name string) bool {
 	return m.expr.MatchString(name)
 }
 
-func parseDomainMatcher(raw string) (IDomainMatcher, error) {
+func ParseDomainMatcher(raw string) (IDomainMatcher, error) {
 	parts := strings.SplitN(raw, ":", 2)
 	if len(parts) == 1 {
-		return suffixMatcher{suffix: normalizeDomain(raw)}, nil
+		return suffixMatcher{suffix: NormalizeDomain(raw)}, nil
 	}
 	kind := strings.ToLower(strings.TrimSpace(parts[0]))
 	valueRaw := strings.TrimSpace(parts[1])
-	value := normalizeDomain(valueRaw)
+	value := NormalizeDomain(valueRaw)
 	switch kind {
 	case "suffix":
 		return suffixMatcher{suffix: value}, nil
@@ -150,97 +169,6 @@ func parseDomainMatcher(raw string) (IDomainMatcher, error) {
 	default:
 		return nil, fmt.Errorf("unknown domain matcher %q", kind)
 	}
-}
-
-type hostRule struct {
-	tag     string
-	records map[string][]net.IP
-}
-
-func newHostRule(tag, file string) (*hostRule, error) {
-	records, err := loadHostFile(file)
-	if err != nil {
-		return nil, err
-	}
-	return &hostRule{
-		tag:     tag,
-		records: records,
-	}, nil
-}
-
-func (r *hostRule) Match(question dns.Question) (*RouteDecision, bool) {
-	name := normalizeDomain(question.Name)
-	if ips, ok := r.records[name]; ok && len(ips) > 0 {
-		answers := buildHostRecords(question, ips)
-		if len(answers) == 0 {
-			return nil, false
-		}
-		return &RouteDecision{
-			Records:   answers,
-			Cacheable: false,
-		}, true
-	}
-
-	if r.tag != "" {
-		return &RouteDecision{
-			OutboundTag: r.tag,
-			Cacheable:   true,
-		}, true
-	}
-	return nil, false
-}
-
-func loadHostFile(path string) (map[string][]net.IP, error) {
-	file, err := os.Open(path)
-	if err != nil {
-		return nil, fmt.Errorf("open host file: %w", err)
-	}
-	defer file.Close()
-
-	scanner := bufio.NewScanner(file)
-	result := make(map[string][]net.IP)
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, "//") {
-			continue
-		}
-		domain, ips := parseHostLine(line)
-		if domain == "" || len(ips) == 0 {
-			continue
-		}
-		result[domain] = ips
-	}
-	if err := scanner.Err(); err != nil {
-		return nil, fmt.Errorf("read host file: %w", err)
-	}
-	return result, nil
-}
-
-func parseHostLine(line string) (string, []net.IP) {
-	parts := strings.SplitN(line, "#", 2)
-	if len(parts) != 2 {
-		return "", nil
-	}
-	domain := normalizeDomain(strings.TrimSpace(parts[0]))
-	if domain == "" {
-		return "", nil
-	}
-	rawList := strings.TrimSpace(parts[1])
-	rawList = strings.TrimPrefix(rawList, "[")
-	rawList = strings.TrimSuffix(rawList, "]")
-	if rawList == "" {
-		return "", nil
-	}
-	chunks := strings.Split(rawList, ",")
-	ips := make([]net.IP, 0, len(chunks))
-	for _, chunk := range chunks {
-		ip := net.ParseIP(strings.TrimSpace(chunk))
-		if ip == nil {
-			continue
-		}
-		ips = append(ips, ip)
-	}
-	return domain, ips
 }
 
 func buildHostRecords(question dns.Question, ips []net.IP) []dns.RR {
@@ -283,7 +211,7 @@ func buildHostRecords(question dns.Question, ips []net.IP) []dns.RR {
 	return records
 }
 
-func normalizeDomain(name string) string {
+func NormalizeDomain(name string) string {
 	name = strings.TrimSpace(strings.TrimSuffix(name, "."))
 	return strings.ToLower(name)
 }
