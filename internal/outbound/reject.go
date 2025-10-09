@@ -8,6 +8,12 @@ import (
 	"go.uber.org/zap"
 )
 
+func init() {
+	RegisterResolverFactory("reject", func(schema, host string, params *ResolverParams) (IDNSResolver, error) {
+		return &rejectResolver{}, nil
+	})
+}
+
 type rejectResolver struct{}
 
 func (r *rejectResolver) String() string { return "reject" }

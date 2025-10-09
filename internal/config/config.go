@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -17,6 +18,7 @@ import (
 type Config struct {
 	Bind          string               `json:"bind"`
 	DataProviders []DataProviderConfig `json:"data_provider"`
+	HostProviders []HostProviderConfig `json:"host_provider"`
 	Outbounds     []OutboundConfig     `json:"outbound"`
 	Routes        []RouteConfig        `json:"route"`
 	Cache         CacheConfig          `json:"cache"`
@@ -45,7 +47,12 @@ type CacheConfig struct {
 // DataProviderConfig defines reusable data source configuration.
 type DataProviderConfig struct {
 	Key  string `json:"key"`
-	Kind string `json:"kind"`
+	File string `json:"file"`
+}
+
+// HostProviderConfig defines host mapping data sources.
+type HostProviderConfig struct {
+	Key  string `json:"key"`
 	File string `json:"file"`
 }
 
@@ -81,8 +88,11 @@ func applyDefaults(cfg *Config) {
 	}
 	for i := range cfg.DataProviders {
 		cfg.DataProviders[i].Key = strings.TrimSpace(cfg.DataProviders[i].Key)
-		cfg.DataProviders[i].Kind = strings.ToLower(strings.TrimSpace(cfg.DataProviders[i].Kind))
 		cfg.DataProviders[i].File = strings.TrimSpace(cfg.DataProviders[i].File)
+	}
+	for i := range cfg.HostProviders {
+		cfg.HostProviders[i].Key = strings.TrimSpace(cfg.HostProviders[i].Key)
+		cfg.HostProviders[i].File = strings.TrimSpace(cfg.HostProviders[i].File)
 	}
 	for i := range cfg.Outbounds {
 		if cfg.Outbounds[i].Parallel <= 0 {
@@ -103,26 +113,32 @@ func applyDefaults(cfg *Config) {
 }
 
 func validate(cfg *Config) error {
-	providerKeys := make(map[string]string, len(cfg.DataProviders))
+	domainProviders := make(map[string]struct{}, len(cfg.DataProviders))
 	for _, provider := range cfg.DataProviders {
 		if provider.Key == "" {
 			return errors.New("data provider key must not be empty")
 		}
-		if _, exists := providerKeys[provider.Key]; exists {
+		if _, exists := domainProviders[provider.Key]; exists {
 			return fmt.Errorf("duplicate data provider key %q", provider.Key)
 		}
-		if provider.Kind == "" {
-			return fmt.Errorf("data provider %q must set kind", provider.Key)
+		if provider.File == "" {
+			return fmt.Errorf("data provider %q requires file path", provider.Key)
 		}
-		switch provider.Kind {
-		case "file", "host":
-			if provider.File == "" {
-				return fmt.Errorf("data provider %q (kind=%s) requires file path", provider.Key, provider.Kind)
-			}
-		default:
-			return fmt.Errorf("unsupported data provider kind %q (key=%s)", provider.Kind, provider.Key)
+		domainProviders[provider.Key] = struct{}{}
+	}
+
+	hostProviders := make(map[string]struct{}, len(cfg.HostProviders))
+	for _, provider := range cfg.HostProviders {
+		if provider.Key == "" {
+			return errors.New("host provider key must not be empty")
 		}
-		providerKeys[provider.Key] = provider.Kind
+		if _, exists := hostProviders[provider.Key]; exists {
+			return fmt.Errorf("duplicate host provider key %q", provider.Key)
+		}
+		if provider.File == "" {
+			return fmt.Errorf("host provider %q requires file path", provider.Key)
+		}
+		hostProviders[provider.Key] = struct{}{}
 	}
 
 	if len(cfg.Outbounds) == 0 {
@@ -140,6 +156,22 @@ func validate(cfg *Config) error {
 		if len(outbound.ServerList) == 0 {
 			return fmt.Errorf("outbound %q must define at least one server", outbound.Tag)
 		}
+		for _, server := range outbound.ServerList {
+			server = strings.TrimSpace(server)
+			if strings.HasPrefix(server, "host://") {
+				parsed, err := url.Parse(server)
+				if err != nil {
+					return fmt.Errorf("outbound %q has invalid host server %q: %w", outbound.Tag, server, err)
+				}
+				key := parsed.Query().Get("key")
+				if key == "" {
+					return fmt.Errorf("outbound %q host server %q missing key parameter", outbound.Tag, server)
+				}
+				if _, ok := hostProviders[key]; !ok {
+					return fmt.Errorf("outbound %q references unknown host provider key %q", outbound.Tag, key)
+				}
+			}
+		}
 	}
 
 	if len(cfg.Routes) == 0 {
@@ -156,27 +188,18 @@ func validate(cfg *Config) error {
 			return fmt.Errorf("route references unknown outbound_tag %q", route.OutboundTag)
 		}
 		hasDomain := false
-		hasHost := false
 		for _, key := range route.DataKeyList {
 			key = strings.TrimSpace(key)
 			if key == "" {
 				return errors.New("route contains empty data_key")
 			}
-			kind, ok := providerKeys[key]
-			if !ok {
+			if _, ok := domainProviders[key]; !ok {
 				return fmt.Errorf("route references unknown data_key %q", key)
 			}
-			switch kind {
-			case "file":
-				hasDomain = true
-			case "host":
-				hasHost = true
-			default:
-				return fmt.Errorf("route references unsupported provider kind %q (key=%s)", kind, key)
-			}
+			hasDomain = true
 		}
-		if !hasDomain && !hasHost {
-			return errors.New("route must reference at least one data provider")
+		if !hasDomain {
+			return errors.New("route must reference at least one domain data provider")
 		}
 	}
 	return nil

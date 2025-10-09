@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math/rand"
+	"net"
 	"net/url"
 	"strings"
 	"sync"
@@ -13,12 +14,16 @@ import (
 	"github.com/miekg/dns"
 	"github.com/xxxsen/common/logutil"
 	"go.uber.org/zap"
-
-	"atlas/internal/config"
 )
 
 // IDnsOutbound represents a DNS outbound transport abstraction.
 type IDnsOutbound interface {
+	Query(ctx context.Context, req *dns.Msg) (*dns.Msg, error)
+}
+
+// IDNSResolver represents a downstream resolver.
+type IDNSResolver interface {
+	String() string
 	Query(ctx context.Context, req *dns.Msg) (*dns.Msg, error)
 }
 
@@ -27,34 +32,28 @@ type Manager struct {
 	groups map[string]*Group
 }
 
-// IManager exposes the subset of outbound manager behaviour required by consumers.
-type IManager interface {
-	Get(tag string) (IDnsOutbound, bool)
+// NewManager creates an empty outbound manager.
+func NewManager() *Manager {
+	return &Manager{groups: make(map[string]*Group)}
 }
 
-// Group is an outbound group containing multiple resolvers.
-type Group struct {
-	tag       string
-	parallel  int
-	resolvers []IDNSResolver
-}
-
-type IDNSResolver interface {
-	String() string
-	Query(ctx context.Context, req *dns.Msg) (*dns.Msg, error)
-}
-
-// NewManager constructs all outbound groups from configuration.
-func NewManager(cfg []config.OutboundConfig) (*Manager, error) {
-	groups := make(map[string]*Group, len(cfg))
-	for _, item := range cfg {
-		group, err := buildGroup(item)
-		if err != nil {
-			return nil, fmt.Errorf("build outbound %q: %w", item.Tag, err)
-		}
-		groups[item.Tag] = group
+// AddOutbound registers a configured outbound group using pre-built resolvers.
+func (m *Manager) AddOutbound(tag string, resolvers []IDNSResolver, parallel int) error {
+	tag = strings.TrimSpace(tag)
+	if tag == "" {
+		return errors.New("outbound tag must not be empty")
 	}
-	return &Manager{groups: groups}, nil
+	if _, exists := m.groups[tag]; exists {
+		return fmt.Errorf("outbound tag %q already exists", tag)
+	}
+	if len(resolvers) == 0 {
+		return fmt.Errorf("outbound %q requires at least one resolver", tag)
+	}
+	if parallel <= 0 {
+		parallel = 1
+	}
+	m.groups[tag] = &Group{tag: tag, parallel: parallel, resolvers: resolvers}
+	return nil
 }
 
 // Get retrieves a configured outbound group.
@@ -66,7 +65,12 @@ func (m *Manager) Get(tag string) (IDnsOutbound, bool) {
 	return group, true
 }
 
-var randMutex sync.Mutex // ensure rand usage is goroutine-safe
+// Group is an outbound group containing multiple resolvers.
+type Group struct {
+	tag       string
+	parallel  int
+	resolvers []IDNSResolver
+}
 
 // Query forwards the DNS request using the group's configured resolvers.
 func (g *Group) Query(ctx context.Context, req *dns.Msg) (*dns.Msg, error) {
@@ -98,9 +102,7 @@ func (g *Group) Query(ctx context.Context, req *dns.Msg) (*dns.Msg, error) {
 			msg, err := resolver.Query(ctx, cloneMessage(req))
 			if err == nil && msg != nil {
 				logger.Debug("resolver succeeded", zap.String("resolver", resolver.String()))
-				once.Do(func() {
-					cancel()
-				})
+				once.Do(func() { cancel() })
 			} else if err != nil {
 				logger.Warn("resolver failed", zap.String("resolver", resolver.String()), zap.Error(err))
 			}
@@ -147,41 +149,94 @@ func (g *Group) pickResolvers() []IDNSResolver {
 	return selected
 }
 
-func buildGroup(cfg config.OutboundConfig) (*Group, error) {
-	resolvers := make([]IDNSResolver, 0, len(cfg.ServerList))
-	for _, raw := range cfg.ServerList {
-		resolver, err := buildResolver(strings.TrimSpace(raw))
+// ResolverParams captures parsed resolver configuration options.
+type ResolverParams struct {
+	Timeout  time.Duration
+	Path     string
+	RawQuery string
+	RawURL   string
+	Values   url.Values
+}
+
+// ResolverFactory builds a resolver for the given schema/host.
+type ResolverFactory func(schema string, host string, params *ResolverParams) (IDNSResolver, error)
+
+var (
+	resolverFactories = make(map[string]ResolverFactory)
+	hostProviderData  map[string]map[string][]net.IP
+)
+
+// RegisterResolverFactory registers a resolver factory for a schema.
+func RegisterResolverFactory(schema string, factory ResolverFactory) {
+	schema = strings.ToLower(schema)
+	resolverFactories[schema] = factory
+}
+
+// SetHostData supplies host provider records for host resolvers.
+func SetHostData(data map[string]map[string][]net.IP) {
+	hostProviderData = data
+}
+
+func getHostRecords(key string) (map[string][]net.IP, bool) {
+	if hostProviderData == nil {
+		return nil, false
+	}
+	records, ok := hostProviderData[key]
+	return records, ok
+}
+
+// CreateResolver constructs a resolver from the raw endpoint definition.
+func CreateResolver(raw string) (IDNSResolver, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, errors.New("empty server endpoint")
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return nil, fmt.Errorf("parse server %q: %w", raw, err)
+	}
+	schema := strings.ToLower(u.Scheme)
+	factory, ok := resolverFactories[schema]
+	if !ok {
+		return nil, fmt.Errorf("unsupported resolver scheme %q", schema)
+	}
+	params, err := parseResolverParams(u)
+	if err != nil {
+		return nil, err
+	}
+	return factory(schema, u.Host, params)
+}
+
+// CreateResolvers constructs a resolver slice from raw endpoints.
+func CreateResolvers(endpoints []string) ([]IDNSResolver, error) {
+	resolvers := make([]IDNSResolver, 0, len(endpoints))
+	for _, endpoint := range endpoints {
+		resolver, err := CreateResolver(endpoint)
 		if err != nil {
 			return nil, err
 		}
 		resolvers = append(resolvers, resolver)
 	}
-	return &Group{
-		tag:       cfg.Tag,
-		parallel:  cfg.Parallel,
-		resolvers: resolvers,
-	}, nil
+	return resolvers, nil
 }
 
-func buildResolver(raw string) (IDNSResolver, error) {
-	if raw == "" {
-		return nil, errors.New("empty server endpoint")
+func parseResolverParams(u *url.URL) (*ResolverParams, error) {
+	values := u.Query()
+	params := &ResolverParams{
+		Path:   u.Path,
+		RawURL: u.String(),
+		Values: values,
 	}
-	if strings.HasPrefix(raw, "reject://") {
-		return &rejectResolver{}, nil
+	if timeoutStr := values.Get("timeout"); timeoutStr != "" {
+		d, err := time.ParseDuration(timeoutStr)
+		if err != nil {
+			return nil, fmt.Errorf("parse timeout for %s: %w", u.String(), err)
+		}
+		params.Timeout = d
+		values.Del("timeout")
 	}
-	parsed, err := url.Parse(raw)
-	if err != nil {
-		return nil, fmt.Errorf("parse server %q: %w", raw, err)
-	}
-	switch parsed.Scheme {
-	case "udp", "tcp", "dot":
-		return newClassicResolver(parsed)
-	case "https", "http":
-		return newDoHResolver(parsed)
-	default:
-		return nil, fmt.Errorf("unsupported resolver scheme %q", parsed.Scheme)
-	}
+	params.RawQuery = values.Encode()
+	return params, nil
 }
 
 func cloneMessage(msg *dns.Msg) *dns.Msg {
@@ -189,7 +244,6 @@ func cloneMessage(msg *dns.Msg) *dns.Msg {
 		return nil
 	}
 	c := msg.Copy()
-	// Ensure recursion desired flag remains set.
 	c.RecursionDesired = true
 	return c
 }
@@ -204,3 +258,5 @@ func questionName(msg *dns.Msg) string {
 	}
 	return strings.TrimSuffix(msg.Question[0].Name, ".")
 }
+
+var randMutex sync.Mutex

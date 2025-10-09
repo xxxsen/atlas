@@ -8,26 +8,26 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 
 	"github.com/miekg/dns"
-	"github.com/xxxsen/common/logutil"
-	"go.uber.org/zap"
 )
 
-type dohResolver struct {
-	endpoint string
-	client   *http.Client
+func init() {
+	RegisterResolverFactory("https", dohFactory)
+	RegisterResolverFactory("http", dohFactory)
 }
 
-func newDoHResolver(u *url.URL) (IDNSResolver, error) {
-	if u == nil {
-		return nil, fmt.Errorf("nil url")
+func dohFactory(schema string, host string, params *ResolverParams) (IDNSResolver, error) {
+	endpoint := fmt.Sprintf("%s://%s%s", schema, host, params.Path)
+	if params.RawQuery != "" {
+		endpoint = endpoint + "?" + params.RawQuery
 	}
-	if u.Scheme != "https" && u.Scheme != "http" {
-		return nil, fmt.Errorf("unsupported DoH scheme %q", u.Scheme)
-	}
+	return newDoHResolver(endpoint, params.Timeout)
+}
 
+func newDoHResolver(endpoint string, timeout time.Duration) (IDNSResolver, error) {
 	transport := &http.Transport{
 		Proxy:               http.ProxyFromEnvironment,
 		MaxConnsPerHost:     10,
@@ -36,25 +36,27 @@ func newDoHResolver(u *url.URL) (IDNSResolver, error) {
 		TLSHandshakeTimeout: 5 * time.Second,
 		DisableCompression:  true,
 	}
-	if u.Scheme == "https" {
-		transport.TLSClientConfig = &tls.Config{
-			ServerName: u.Hostname(),
+	if strings.HasPrefix(endpoint, "https://") {
+		u, err := url.Parse(endpoint)
+		if err != nil {
+			return nil, fmt.Errorf("parse doh endpoint: %w", err)
 		}
+		transport.TLSClientConfig = &tls.Config{ServerName: u.Hostname()}
 	}
-
-	client := &http.Client{
-		Timeout:   6 * time.Second,
-		Transport: transport,
+	if timeout <= 0 {
+		timeout = 6 * time.Second
 	}
+	client := &http.Client{Timeout: timeout, Transport: transport}
+	return &dohResolver{endpoint: endpoint, client: client}, nil
+}
 
-	return &dohResolver{
-		endpoint: u.String(),
-		client:   client,
-	}, nil
+type dohResolver struct {
+	endpoint string
+	client   *http.Client
 }
 
 func (r *dohResolver) String() string {
-	return fmt.Sprintf("doh:%s", r.endpoint)
+	return "doh:" + r.endpoint
 }
 
 func (r *dohResolver) Query(ctx context.Context, req *dns.Msg) (*dns.Msg, error) {
@@ -62,17 +64,13 @@ func (r *dohResolver) Query(ctx context.Context, req *dns.Msg) (*dns.Msg, error)
 		return nil, fmt.Errorf("invalid doh resolver")
 	}
 
-	log := logutil.GetLogger(ctx).With(zap.String("resolver", r.String()), zap.String("question", questionName(req)))
-	log.Debug("sending doh dns query")
 	payload, err := req.Pack()
 	if err != nil {
-		log.Warn("failed to pack dns request", zap.Error(err))
 		return nil, fmt.Errorf("pack dns request: %w", err)
 	}
 
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, r.endpoint, bytes.NewReader(payload))
 	if err != nil {
-		log.Warn("failed to build doh request", zap.Error(err))
 		return nil, fmt.Errorf("create doh request: %w", err)
 	}
 	httpReq.Header.Set("Content-Type", "application/dns-message")
@@ -80,28 +78,23 @@ func (r *dohResolver) Query(ctx context.Context, req *dns.Msg) (*dns.Msg, error)
 
 	resp, err := r.client.Do(httpReq)
 	if err != nil {
-		log.Warn("doh request transport failed", zap.Error(err))
 		return nil, fmt.Errorf("doh request: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 256))
-		log.Warn("doh request returned non-success", zap.Int("status", resp.StatusCode))
 		return nil, fmt.Errorf("doh %s returned %d: %s", r.endpoint, resp.StatusCode, string(body))
 	}
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		log.Warn("failed reading doh response", zap.Error(err))
 		return nil, fmt.Errorf("read doh response: %w", err)
 	}
 
 	message := &dns.Msg{}
 	if err := message.Unpack(body); err != nil {
-		log.Warn("failed to decode doh response", zap.Error(err))
 		return nil, fmt.Errorf("decode doh response: %w", err)
 	}
-	log.Debug("doh dns query succeeded")
 	return message, nil
 }

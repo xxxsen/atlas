@@ -34,17 +34,29 @@ func main() {
 		int(cfg.Log.FileSize), int(cfg.Log.KeepDays), cfg.Log.Console)
 	defer logkit.Sync() //nolint:errcheck
 
-	outboundManager, err := outbound.NewManager(cfg.Outbounds)
-	if err != nil {
-		logkit.Fatal("initialise outbounds failed", zap.Error(err))
-	}
-
-	providers, err := provider.LoadProviders(cfg.DataProviders)
+	domainProviders, err := provider.LoadProviders(cfg.DataProviders)
 	if err != nil {
 		logkit.Fatal("load data providers failed", zap.Error(err))
 	}
 
-	rules, err := routing.BuildRules(cfg.Routes, providers)
+	hostProviders, err := provider.LoadHostProviders(cfg.HostProviders)
+	if err != nil {
+		logkit.Fatal("load host providers failed", zap.Error(err))
+	}
+
+	outbound.SetHostData(hostProviders)
+	outboundManager := outbound.NewManager()
+	for _, ob := range cfg.Outbounds {
+		resolvers, err := outbound.CreateResolvers(ob.ServerList)
+		if err != nil {
+			logkit.Fatal("initialise resolvers failed", zap.Error(err))
+		}
+		if err := outboundManager.AddOutbound(ob.Tag, resolvers, ob.Parallel); err != nil {
+			logkit.Fatal("initialise outbounds failed", zap.Error(err))
+		}
+	}
+
+	rules, err := routing.BuildRules(cfg.Routes, domainProviders)
 	if err != nil {
 		logkit.Fatal("initialise routing rules failed", zap.Error(err))
 	}

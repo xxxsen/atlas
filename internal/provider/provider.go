@@ -2,6 +2,7 @@ package provider
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -15,113 +16,74 @@ const (
 	KindHost       = "host"
 )
 
-// ProviderData represents prepared data produced by a provider.
+// ProviderData represents prepared domain data.
 type ProviderData struct {
 	Key         string
-	Kind        string
 	DomainRules []string
-	HostRecords map[string][]net.IP
 }
 
-// IRouteDataProvider loads routing data from a configured source.
-type IRouteDataProvider interface {
-	Key() string
-	Kind() string
-	Provide() (*ProviderData, error)
-}
-
-// LoadProviders processes provider configuration into runtime datasets.
+// LoadProviders processes domain provider configuration into runtime datasets.
 func LoadProviders(cfg []config.DataProviderConfig) (map[string]*ProviderData, error) {
 	result := make(map[string]*ProviderData, len(cfg))
 	for _, item := range cfg {
-		provider, err := newProvider(item)
+		key := strings.TrimSpace(item.Key)
+		if key == "" {
+			return nil, errors.New("data provider key must not be empty")
+		}
+		if _, exists := result[key]; exists {
+			return nil, fmt.Errorf("duplicate data provider key %q", key)
+		}
+		rules, err := loadDomainRulesFromFile(strings.TrimSpace(item.File))
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("load data provider %q: %w", key, err)
 		}
-		if _, exists := result[provider.Key()]; exists {
-			return nil, fmt.Errorf("duplicate data provider key %q", provider.Key())
-		}
-		data, err := provider.Provide()
-		if err != nil {
-			return nil, err
-		}
-		result[provider.Key()] = data
+		result[key] = &ProviderData{Key: key, DomainRules: rules}
 	}
 	return result, nil
 }
 
-func newProvider(cfg config.DataProviderConfig) (IRouteDataProvider, error) {
-	key := strings.TrimSpace(cfg.Key)
-	kind := strings.ToLower(strings.TrimSpace(cfg.Kind))
-	file := strings.TrimSpace(cfg.File)
-	switch kind {
-	case KindDomainFile:
-		if file == "" {
-			return nil, fmt.Errorf("data provider %q requires file path", key)
+// BuildChunks converts provider data into normalized routing inputs.
+func BuildChunks(providers []*ProviderData) ([]string, error) {
+	domainRules := make([]string, 0, len(providers))
+	for _, provider := range providers {
+		domainRules = append(domainRules, provider.DomainRules...)
+	}
+	return domainRules, nil
+}
+
+// LoadHostProviders loads host mapping datasets.
+func LoadHostProviders(cfg []config.HostProviderConfig) (map[string]map[string][]net.IP, error) {
+	result := make(map[string]map[string][]net.IP, len(cfg))
+	for _, item := range cfg {
+		key := strings.TrimSpace(item.Key)
+		if key == "" {
+			return nil, errors.New("host provider key must not be empty")
 		}
-		return &domainFileProvider{key: key, path: file}, nil
-	case KindHost:
-		if file == "" {
-			return nil, fmt.Errorf("data provider %q requires file path", key)
+		if _, exists := result[key]; exists {
+			return nil, fmt.Errorf("duplicate host provider key %q", key)
 		}
-		return &hostFileProvider{key: key, path: file}, nil
-	default:
-		return nil, fmt.Errorf("unsupported data provider kind %q (key=%s)", cfg.Kind, cfg.Key)
+		data, err := loadHostFile(strings.TrimSpace(item.File))
+		if err != nil {
+			return nil, fmt.Errorf("load host provider %q: %w", key, err)
+		}
+		result[key] = data
 	}
-}
-
-type domainFileProvider struct {
-	key  string
-	path string
-}
-
-func (p *domainFileProvider) Key() string  { return p.key }
-func (p *domainFileProvider) Kind() string { return KindDomainFile }
-
-func (p *domainFileProvider) Provide() (*ProviderData, error) {
-	rules, err := loadDomainRulesFromFile(p.path)
-	if err != nil {
-		return nil, fmt.Errorf("load domain provider %q: %w", p.key, err)
-	}
-	return &ProviderData{
-		Key:         p.key,
-		Kind:        KindDomainFile,
-		DomainRules: rules,
-	}, nil
-}
-
-type hostFileProvider struct {
-	key  string
-	path string
-}
-
-func (p *hostFileProvider) Key() string  { return p.key }
-func (p *hostFileProvider) Kind() string { return KindHost }
-
-func (p *hostFileProvider) Provide() (*ProviderData, error) {
-	records, err := loadHostFile(p.path)
-	if err != nil {
-		return nil, fmt.Errorf("load host provider %q: %w", p.key, err)
-	}
-	return &ProviderData{
-		Key:         p.key,
-		Kind:        KindHost,
-		HostRecords: records,
-	}, nil
+	return result, nil
 }
 
 func loadDomainRulesFromFile(path string) ([]string, error) {
+	if path == "" {
+		return nil, errors.New("domain provider file is empty")
+	}
 	file, err := os.Open(path)
 	if err != nil {
 		return nil, fmt.Errorf("open domain file: %w", err)
 	}
 	defer file.Close()
 
-	var rules []string
+	rules := make([]string, 0)
 	scanner := bufio.NewScanner(file)
-	lineNo := 0
 	for scanner.Scan() {
-		lineNo++
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, "//") {
 			continue
@@ -138,6 +100,9 @@ func loadDomainRulesFromFile(path string) ([]string, error) {
 }
 
 func loadHostFile(path string) (map[string][]net.IP, error) {
+	if path == "" {
+		return nil, errors.New("host provider file is empty")
+	}
 	file, err := os.Open(path)
 	if err != nil {
 		return nil, fmt.Errorf("open host file: %w", err)

@@ -2,7 +2,6 @@ package routing
 
 import (
 	"fmt"
-	"net"
 	"regexp"
 	"strings"
 
@@ -28,32 +27,27 @@ type IRouteRule interface {
 func BuildRules(cfg []config.RouteConfig, providers map[string]*providerpkg.ProviderData) ([]IRouteRule, error) {
 	rules := make([]IRouteRule, 0, len(cfg))
 	for _, item := range cfg {
-		matchers := make([]IDomainMatcher, 0)
-		hostRecords := make(map[string][]net.IP)
+		providerList := make([]*providerpkg.ProviderData, 0, len(item.DataKeyList))
 		for _, key := range item.DataKeyList {
 			provider, ok := providers[key]
 			if !ok {
 				return nil, fmt.Errorf("route references unknown data_key %q", key)
 			}
-			switch provider.Kind {
-			case providerpkg.KindDomainFile:
-				for _, rule := range provider.DomainRules {
-					matcher, err := ParseDomainMatcher(rule)
-					if err != nil {
-						return nil, fmt.Errorf("parse domain rule from data_key %q: %w", key, err)
-					}
-					matchers = append(matchers, matcher)
-				}
-			case providerpkg.KindHost:
-				for domain, ips := range provider.HostRecords {
-					existing := hostRecords[domain]
-					hostRecords[domain] = append(existing, ips...)
-				}
-			default:
-				return nil, fmt.Errorf("unsupported provider kind %q for data_key %s", provider.Kind, key)
-			}
+			providerList = append(providerList, provider)
 		}
-		rule, err := newRouteRule(item.OutboundTag, matchers, hostRecords)
+		domainRules, err := providerpkg.BuildChunks(providerList)
+		if err != nil {
+			return nil, err
+		}
+		matchers := make([]IDomainMatcher, 0, len(domainRules))
+		for _, rule := range domainRules {
+			matcher, err := ParseDomainMatcher(rule)
+			if err != nil {
+				return nil, fmt.Errorf("parse domain rule from data providers: %w", err)
+			}
+			matchers = append(matchers, matcher)
+		}
+		rule, err := newRouteRule(item.OutboundTag, matchers)
 		if err != nil {
 			return nil, err
 		}
@@ -65,50 +59,29 @@ func BuildRules(cfg []config.RouteConfig, providers map[string]*providerpkg.Prov
 type routeRule struct {
 	tag            string
 	domainMatchers []IDomainMatcher
-	hostRecords    map[string][]net.IP
 }
 
-func newRouteRule(tag string, matchers []IDomainMatcher, hosts map[string][]net.IP) (*routeRule, error) {
-	if len(matchers) == 0 && len(hosts) == 0 {
-		return nil, fmt.Errorf("route requires domain or host data")
+func newRouteRule(tag string, matchers []IDomainMatcher) (*routeRule, error) {
+	if len(matchers) == 0 {
+		return nil, fmt.Errorf("route requires domain data providers")
 	}
-	if len(matchers) > 0 && strings.TrimSpace(tag) == "" {
-		return nil, fmt.Errorf("route with domain data requires outbound tag")
+	if strings.TrimSpace(tag) == "" {
+		return nil, fmt.Errorf("route requires outbound tag")
 	}
 	return &routeRule{
 		tag:            tag,
 		domainMatchers: matchers,
-		hostRecords:    hosts,
 	}, nil
 }
 
 func (r *routeRule) Match(question dns.Question) (*RouteDecision, bool) {
 	name := NormalizeDomain(question.Name)
-	if len(r.hostRecords) > 0 {
-		if ips, ok := r.hostRecords[name]; ok && len(ips) > 0 {
-			answers := buildHostRecords(question, ips)
-			if len(answers) > 0 {
-				return &RouteDecision{
-					Records:   answers,
-					Cacheable: false,
-				}, true
-			}
-		}
-		if len(r.domainMatchers) == 0 && strings.TrimSpace(r.tag) != "" {
+	for _, matcher := range r.domainMatchers {
+		if matcher.Match(name) {
 			return &RouteDecision{
 				OutboundTag: r.tag,
 				Cacheable:   true,
 			}, true
-		}
-	}
-	if len(r.domainMatchers) > 0 {
-		for _, matcher := range r.domainMatchers {
-			if matcher.Match(name) {
-				return &RouteDecision{
-					OutboundTag: r.tag,
-					Cacheable:   true,
-				}, true
-			}
 		}
 	}
 	return nil, false
@@ -169,46 +142,6 @@ func ParseDomainMatcher(raw string) (IDomainMatcher, error) {
 	default:
 		return nil, fmt.Errorf("unknown domain matcher %q", kind)
 	}
-}
-
-func buildHostRecords(question dns.Question, ips []net.IP) []dns.RR {
-	if len(ips) == 0 {
-		return nil
-	}
-	name := question.Name
-	if name == "" {
-		return nil
-	}
-	var records []dns.RR
-	for _, ip := range ips {
-		if ip == nil {
-			continue
-		}
-		if ip4 := ip.To4(); ip4 != nil && (question.Qtype == dns.TypeA || question.Qtype == dns.TypeANY) {
-			rr := &dns.A{
-				Hdr: dns.RR_Header{
-					Name:   name,
-					Rrtype: dns.TypeA,
-					Class:  dns.ClassINET,
-					Ttl:    60,
-				},
-				A: ip4,
-			}
-			records = append(records, rr)
-		} else if ip6 := ip.To16(); ip6 != nil && ip.To4() == nil && (question.Qtype == dns.TypeAAAA || question.Qtype == dns.TypeANY) {
-			rr := &dns.AAAA{
-				Hdr: dns.RR_Header{
-					Name:   name,
-					Rrtype: dns.TypeAAAA,
-					Class:  dns.ClassINET,
-					Ttl:    60,
-				},
-				AAAA: ip6,
-			}
-			records = append(records, rr)
-		}
-	}
-	return records
 }
 
 func NormalizeDomain(name string) string {
