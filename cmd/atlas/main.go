@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 	"flag"
-	"log"
+	"fmt"
 	"os"
 	"os/signal"
 	"syscall"
@@ -14,6 +14,10 @@ import (
 	"atlas/internal/outbound"
 	"atlas/internal/routing"
 	"atlas/internal/server"
+
+	"github.com/xxxsen/common/logger"
+	"github.com/xxxsen/common/logutil"
+	"go.uber.org/zap"
 )
 
 func main() {
@@ -21,22 +25,27 @@ func main() {
 	flag.Parse()
 
 	if *cfgPath == "" {
-		log.Fatal("config path is required (use --config)")
+		fmt.Fprintln(os.Stderr, "config path is required (use --config)")
+		os.Exit(1)
 	}
+
+	logkit := logger.Init("", "info", 0, 0, 0, true)
+	defer logkit.Sync() //nolint:errcheck
+	rootLogger := logutil.GetLogger(context.Background())
 
 	cfg, err := config.Load(*cfgPath)
 	if err != nil {
-		log.Fatalf("load config: %v", err)
+		rootLogger.Fatal("load config failed", zap.Error(err))
 	}
 
 	outboundManager, err := outbound.NewManager(cfg.Outbounds)
 	if err != nil {
-		log.Fatalf("initialise outbounds: %v", err)
+		rootLogger.Fatal("initialise outbounds failed", zap.Error(err))
 	}
 
 	rules, err := routing.BuildRules(cfg.Routes)
 	if err != nil {
-		log.Fatalf("initialise routing rules: %v", err)
+		rootLogger.Fatal("initialise routing rules failed", zap.Error(err))
 	}
 
 	var responseCache *cache.Cache
@@ -44,15 +53,14 @@ func main() {
 		responseCache = cache.New(cfg.Cache.Size, cfg.Cache.Lazy)
 	}
 
-	logger := log.New(os.Stdout, "[atlas] ", log.LstdFlags)
-	forwarder := server.New(cfg, outboundManager, rules, responseCache, logger)
+	forwarder := server.New(cfg, outboundManager, rules, responseCache)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	logger.Printf("dns forwarder listening on %s", cfg.Bind)
+	rootLogger.Info("dns forwarder listening", zap.String("addr", cfg.Bind))
 	if err := forwarder.Start(ctx); err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, syscall.EINTR) {
-		logger.Fatalf("server error: %v", err)
+		rootLogger.Fatal("server error", zap.Error(err))
 	}
-	logger.Println("shutdown complete")
+	rootLogger.Info("shutdown complete")
 }

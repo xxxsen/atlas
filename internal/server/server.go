@@ -3,11 +3,12 @@ package server
 import (
 	"context"
 	"fmt"
-	"log"
 	"strings"
 	"time"
 
 	"github.com/miekg/dns"
+	"github.com/xxxsen/common/logutil"
+	"go.uber.org/zap"
 
 	"atlas/internal/cache"
 	"atlas/internal/config"
@@ -25,14 +26,11 @@ type Server struct {
 	cache        *cache.Cache
 	cacheEnabled bool
 	timeout      time.Duration
-	logger       *log.Logger
+	baseCtx      context.Context
 }
 
 // New creates a DNS forwarder server using the supplied configuration.
-func New(cfg *config.Config, outbounds *outbound.Manager, routes []routing.IRouteRule, responseCache *cache.Cache, logger *log.Logger) *Server {
-	if logger == nil {
-		logger = log.Default()
-	}
+func New(cfg *config.Config, outbounds *outbound.Manager, routes []routing.IRouteRule, responseCache *cache.Cache) *Server {
 	s := &Server{
 		addr:         cfg.Bind,
 		outbounds:    outbounds,
@@ -40,7 +38,7 @@ func New(cfg *config.Config, outbounds *outbound.Manager, routes []routing.IRout
 		cache:        responseCache,
 		cacheEnabled: responseCache != nil,
 		timeout:      6 * time.Second,
-		logger:       logger,
+		baseCtx:      context.Background(),
 	}
 	s.udpServer = &dns.Server{
 		Addr:    cfg.Bind,
@@ -61,6 +59,10 @@ func (s *Server) Start(ctx context.Context) error {
 		return fmt.Errorf("outbound manager not initialised")
 	}
 	errCh := make(chan error, 2)
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	s.baseCtx = ctx
 	go func() {
 		errCh <- s.udpServer.ListenAndServe()
 	}()
@@ -83,13 +85,15 @@ func (s *Server) shutdown() {
 }
 
 func (s *Server) handleDNS(w dns.ResponseWriter, req *dns.Msg) {
+	ctx := s.baseCtx
+	log := logutil.GetLogger(ctx)
 	defer func() {
 		if r := recover(); r != nil {
-			s.logger.Printf("panic recovered while handling dns request: %v", r)
+			log.Error("panic recovered while handling dns request", zap.Any("panic", r))
 		}
 	}()
 
-	resp := s.processRequest(req)
+	resp := s.processRequest(ctx, req)
 	if resp == nil {
 		resp = new(dns.Msg)
 		resp.SetRcode(req, dns.RcodeServerFailure)
@@ -102,11 +106,11 @@ func (s *Server) handleDNS(w dns.ResponseWriter, req *dns.Msg) {
 	resp.Compress = true
 
 	if err := w.WriteMsg(resp); err != nil {
-		s.logger.Printf("write response failed: %v", err)
+		log.Error("write response failed", zap.Error(err))
 	}
 }
 
-func (s *Server) processRequest(req *dns.Msg) *dns.Msg {
+func (s *Server) processRequest(ctx context.Context, req *dns.Msg) *dns.Msg {
 	if req == nil {
 		return nil
 	}
@@ -117,6 +121,7 @@ func (s *Server) processRequest(req *dns.Msg) *dns.Msg {
 	}
 	question := req.Question[0]
 	key := cacheKey(question)
+	log := logutil.GetLogger(ctx)
 
 	for _, rule := range s.routes {
 		decision, ok := rule.Match(question)
@@ -134,7 +139,7 @@ func (s *Server) processRequest(req *dns.Msg) *dns.Msg {
 		}
 		group, ok := s.outbounds.Get(decision.OutboundTag)
 		if !ok {
-			s.logger.Printf("no outbound found for tag %q", decision.OutboundTag)
+			log.Warn("no outbound found for tag", zap.String("tag", decision.OutboundTag))
 			continue
 		}
 
@@ -144,17 +149,17 @@ func (s *Server) processRequest(req *dns.Msg) *dns.Msg {
 				reply := res.Msg.Copy()
 				reply.Question = req.Question
 				if res.ShouldRefresh {
-					go s.refresh(key, req, group)
+					go s.refresh(ctx, key, req, group)
 				}
 				return reply
 			}
 		}
 
-		ctx, cancel := context.WithTimeout(context.Background(), s.timeout)
-		resp, err := group.Query(ctx, cloneRequest(req))
+		ctxTimeout, cancel := context.WithTimeout(ctx, s.timeout)
+		resp, err := group.Query(ctxTimeout, cloneRequest(req))
 		cancel()
 		if err != nil {
-			s.logger.Printf("query outbound %q failed: %v", decision.OutboundTag, err)
+			logutil.GetLogger(ctx).Error("query outbound failed", zap.String("tag", decision.OutboundTag), zap.Error(err))
 			continue
 		}
 		resp.Question = req.Question
@@ -167,15 +172,15 @@ func (s *Server) processRequest(req *dns.Msg) *dns.Msg {
 	return nil
 }
 
-func (s *Server) refresh(key string, req *dns.Msg, group outbound.IDnsOutbound) {
+func (s *Server) refresh(ctx context.Context, key string, req *dns.Msg, group outbound.IDnsOutbound) {
 	if s.cache == nil {
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), s.timeout)
+	ctxTimeout, cancel := context.WithTimeout(ctx, s.timeout)
 	defer cancel()
-	resp, err := group.Query(ctx, cloneRequest(req))
+	resp, err := group.Query(ctxTimeout, cloneRequest(req))
 	if err != nil {
-		s.logger.Printf("lazy refresh failed for %s: %v", key, err)
+		logutil.GetLogger(ctx).Warn("lazy refresh failed", zap.String("key", key), zap.Error(err))
 		s.cache.MarkRefreshComplete(key)
 		return
 	}
