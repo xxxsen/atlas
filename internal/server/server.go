@@ -15,86 +15,24 @@ import (
 	"atlas/internal/routing"
 )
 
-// Cache abstracts cache operations used by the server.
-type Cache interface {
-	Get(key string) (cache.Result, bool)
-	Set(key string, msg *dns.Msg)
-	MarkRefreshComplete(key string)
-}
-
-// OutboundManager describes the behaviour required from an outbound manager.
-type OutboundManager interface {
-	Get(tag string) (outbound.IDnsOutbound, bool)
-}
-
-// Server exposes the DNS server behaviour.
-type Server interface {
+// IDNSServer exposes the DNS server behaviour.
+type IDNSServer interface {
 	Start(ctx context.Context) error
-}
-
-// Option configures the DNS server.
-type Option func(*options)
-
-type options struct {
-	bind    string
-	timeout time.Duration
-	manager OutboundManager
-	routes  []routing.IRouteRule
-	cache   Cache
-}
-
-// WithBind configures the bind address.
-func WithBind(bind string) Option {
-	return func(o *options) {
-		if strings.TrimSpace(bind) != "" {
-			o.bind = bind
-		}
-	}
-}
-
-// WithTimeout overrides the request timeout.
-func WithTimeout(t time.Duration) Option {
-	return func(o *options) {
-		if t > 0 {
-			o.timeout = t
-		}
-	}
-}
-
-// WithOutboundManager provides the outbound manager implementation.
-func WithOutboundManager(m OutboundManager) Option {
-	return func(o *options) {
-		o.manager = m
-	}
-}
-
-// WithRoutes supplies routing rules.
-func WithRoutes(routes []routing.IRouteRule) Option {
-	return func(o *options) {
-		o.routes = append([]routing.IRouteRule(nil), routes...)
-	}
-}
-
-// WithCache sets the cache implementation.
-func WithCache(c Cache) Option {
-	return func(o *options) {
-		o.cache = c
-	}
 }
 
 type dnsServer struct {
 	bind         string
 	udpServer    *dns.Server
 	tcpServer    *dns.Server
-	outbounds    OutboundManager
+	outbounds    outbound.IOutboundManager
 	routes       []routing.IRouteRule
-	cache        Cache
+	cache        cache.IDNSCache
 	cacheEnabled bool
 	timeout      time.Duration
 }
 
 // New creates a DNS forwarder server using the supplied configuration.
-func New(opts ...Option) (Server, error) {
+func New(opts ...Option) (IDNSServer, error) {
 	cfg := options{
 		bind:    ":5353",
 		timeout: 6 * time.Second,

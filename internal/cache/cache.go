@@ -17,6 +17,13 @@ type Result struct {
 	ShouldRefresh bool
 }
 
+// IDNSCache abstracts cache operations used by the server.
+type IDNSCache interface {
+	Get(key string) (Result, bool)
+	Set(key string, msg *dns.Msg)
+	MarkRefreshComplete(key string)
+}
+
 // Cache is a simple LRU cache with TTL support and optional lazy refresh.
 type Cache struct {
 	mu       sync.Mutex
