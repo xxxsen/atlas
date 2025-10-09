@@ -126,8 +126,8 @@ func (g *Group) pickResolvers() []resolver {
 }
 
 func buildGroup(cfg config.OutboundConfig) (*Group, error) {
-	resolvers := make([]resolver, 0, len(cfg.Servers))
-	for _, raw := range cfg.Servers {
+	resolvers := make([]resolver, 0, len(cfg.ServerList))
+	for _, raw := range cfg.ServerList {
 		resolver, err := buildResolver(strings.TrimSpace(raw))
 		if err != nil {
 			return nil, err

@@ -21,9 +21,9 @@ type Config struct {
 
 // OutboundConfig defines an outbound resolver group.
 type OutboundConfig struct {
-	Tag      string   `json:"tag"`
-	Servers  []string `json:"server"`
-	Parallel int      `json:"parallel"`
+	Tag        string   `json:"tag"`
+	ServerList []string `json:"server_list"`
+	Parallel   int      `json:"parallel"`
 }
 
 // RouteConfig defines a single routing rule.
@@ -74,14 +74,14 @@ func applyDefaults(cfg *Config) {
 		if cfg.Outbounds[i].Parallel <= 0 {
 			cfg.Outbounds[i].Parallel = 1
 		}
-		servers := cfg.Outbounds[i].Servers[:0]
-		for _, srv := range cfg.Outbounds[i].Servers {
+		servers := cfg.Outbounds[i].ServerList[:0]
+		for _, srv := range cfg.Outbounds[i].ServerList {
 			srv = strings.TrimSpace(srv)
 			if srv != "" {
 				servers = append(servers, srv)
 			}
 		}
-		cfg.Outbounds[i].Servers = servers
+		cfg.Outbounds[i].ServerList = servers
 	}
 	if cfg.Cache.Size <= 0 {
 		cfg.Cache.Size = 1024
@@ -101,7 +101,7 @@ func validate(cfg *Config) error {
 			return fmt.Errorf("duplicate outbound tag %q", outbound.Tag)
 		}
 		seenTags[outbound.Tag] = struct{}{}
-		if len(outbound.Servers) == 0 {
+		if len(outbound.ServerList) == 0 {
 			return fmt.Errorf("outbound %q must define at least one server", outbound.Tag)
 		}
 	}
