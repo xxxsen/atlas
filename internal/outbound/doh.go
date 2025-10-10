@@ -1,6 +1,7 @@
 package outbound
 
 import (
+	"atlas/internal/outbound/model"
 	"bytes"
 	"context"
 	"crypto/tls"
@@ -15,16 +16,12 @@ import (
 )
 
 func init() {
-	RegisterResolverFactory("https", dohFactory)
-	RegisterResolverFactory("http", dohFactory)
+	Register("https", dohResolverFactory)
 }
 
-func dohFactory(schema string, host string, params *ResolverParams) (IDNSResolver, error) {
-	endpoint := fmt.Sprintf("%s://%s%s", schema, host, params.Path)
-	if params.RawQuery != "" {
-		endpoint = endpoint + "?" + params.RawQuery
-	}
-	return newDoHResolver(endpoint, params.Timeout)
+func dohResolverFactory(schema string, host string, params *model.ResolverParams) (IDNSResolver, error) {
+	endpoint := fmt.Sprintf("%s://%s%s", schema, host, params.URL.RawPath)
+	return newDoHResolver(endpoint, time.Duration(params.CustomParams.Timeout)*time.Millisecond)
 }
 
 func newDoHResolver(endpoint string, timeout time.Duration) (IDNSResolver, error) {

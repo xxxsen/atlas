@@ -166,12 +166,6 @@ var (
 	hostProviderData  map[string]map[string][]net.IP
 )
 
-// RegisterResolverFactory registers a resolver factory for a schema.
-func RegisterResolverFactory(schema string, factory ResolverFactory) {
-	schema = strings.ToLower(schema)
-	resolverFactories[schema] = factory
-}
-
 // SetHostData supplies host provider records for host resolvers.
 func SetHostData(data map[string]map[string][]net.IP) {
 	hostProviderData = data

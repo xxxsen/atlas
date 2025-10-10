@@ -1,6 +1,7 @@
 package outbound
 
 import (
+	"atlas/internal/outbound/model"
 	"context"
 	"crypto/tls"
 	"fmt"
@@ -12,37 +13,34 @@ import (
 )
 
 func init() {
-	RegisterResolverFactory("udp", classicFactory("udp", "53", 4*time.Second))
-	RegisterResolverFactory("tcp", classicFactory("tcp", "53", 4*time.Second))
-	RegisterResolverFactory("dot", classicFactory("dot", "853", 6*time.Second))
+	Register("tcp", basicResolverFactory)
+	Register("udp", basicResolverFactory)
+	Register("dot", basicResolverFactory)
 }
 
-func classicFactory(schema, defaultPort string, defaultTimeout time.Duration) ResolverFactory {
-	return func(_ string, host string, params *ResolverParams) (IDNSResolver, error) {
-		timeout := params.Timeout
-		if timeout <= 0 {
-			timeout = defaultTimeout
+func basicResolverFactory(schema string, host string, params *model.ResolverParams) (IDNSResolver, error) {
+	if schema == "udp" || schema == "tcp" {
+		client := &dns.Client{Net: schema, Timeout: time.Duration(params.CustomParams.Timeout) * time.Millisecond}
+		return &classicResolver{
+			addr:   host,
+			client: client,
+		}, nil
+	} else if schema == "dot" {
+		hostname, _, err := net.SplitHostPort(host)
+		if err != nil {
+			return nil, err
 		}
-		switch schema {
-		case "udp", "tcp":
-			addr := ensurePort(host, defaultPort)
-			client := &dns.Client{Net: schema, Timeout: timeout}
-			return &classicResolver{addr: addr, client: client}, nil
-		case "dot":
-			hostname, port := splitHostPort(host, defaultPort)
-			client := &dns.Client{
-				Net:     "tcp-tls",
-				Timeout: timeout,
-				TLSConfig: &tls.Config{
-					ServerName: hostname,
-					MinVersion: tls.VersionTLS12,
-				},
-			}
-			return &classicResolver{addr: net.JoinHostPort(hostname, port), client: client}, nil
-		default:
-			return nil, fmt.Errorf("unsupported classic schema %q", schema)
+		client := &dns.Client{
+			Net:     "tcp-tls",
+			Timeout: time.Duration(params.CustomParams.Timeout) * time.Millisecond,
+			TLSConfig: &tls.Config{
+				ServerName: hostname,
+				MinVersion: tls.VersionTLS12,
+			},
 		}
+		return &classicResolver{addr: host, client: client}, nil
 	}
+	return nil, fmt.Errorf("unsupported dns type:%s", schema)
 }
 
 type classicResolver struct {
@@ -62,21 +60,6 @@ func (r *classicResolver) Query(ctx context.Context, req *dns.Msg) (*dns.Msg, er
 		return nil, fmt.Errorf("resolver not initialised")
 	}
 	return exchangeContext(ctx, r.client, req, r.addr)
-}
-
-func ensurePort(host, defaultPort string) string {
-	if hasPort(host) {
-		return host
-	}
-	return net.JoinHostPort(host, defaultPort)
-}
-
-func splitHostPort(host, defaultPort string) (string, string) {
-	if hasPort(host) {
-		name, port, _ := net.SplitHostPort(host)
-		return name, port
-	}
-	return host, defaultPort
 }
 
 func hasPort(host string) bool {
