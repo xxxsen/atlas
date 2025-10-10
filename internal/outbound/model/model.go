@@ -8,5 +8,5 @@ type BasicResolverParam struct {
 
 type ResolverParams struct {
 	URL          *url.URL
-	CustomParams *BasicResolverParam
+	CustomParams BasicResolverParam
 }

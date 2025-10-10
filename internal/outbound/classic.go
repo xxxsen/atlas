@@ -6,7 +6,6 @@ import (
 	"crypto/tls"
 	"fmt"
 	"net"
-	"strings"
 	"time"
 
 	"github.com/miekg/dns"
@@ -59,9 +58,19 @@ func (r *classicResolver) Query(ctx context.Context, req *dns.Msg) (*dns.Msg, er
 	if r == nil || r.client == nil {
 		return nil, fmt.Errorf("resolver not initialised")
 	}
-	return exchangeContext(ctx, r.client, req, r.addr)
+	return r.exchangeContext(ctx, r.client, req, r.addr)
 }
 
-func hasPort(host string) bool {
-	return strings.LastIndex(host, ":") > strings.LastIndex(host, "]")
+func (r *classicResolver) exchangeContext(ctx context.Context, client *dns.Client, req *dns.Msg, addr string) (*dns.Msg, error) {
+	if client == nil {
+		return nil, fmt.Errorf("dns client is nil")
+	}
+	resp, _, err := client.ExchangeContext(ctx, req, addr)
+	if err != nil {
+		return nil, err
+	}
+	if resp == nil {
+		return nil, fmt.Errorf("no response from %s", addr)
+	}
+	return resp, nil
 }

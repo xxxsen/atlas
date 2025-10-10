@@ -104,12 +104,6 @@ func (s *dnsServer) shutdown() {
 
 func (s *dnsServer) handleDNS(ctx context.Context, w dns.ResponseWriter, req *dns.Msg) {
 	log := logutil.GetLogger(ctx)
-	defer func() {
-		if r := recover(); r != nil {
-			log.Error("panic recovered while handling dns request", zap.Any("panic", r))
-		}
-	}()
-
 	resp := s.processRequest(ctx, req)
 	if resp == nil {
 		resp = new(dns.Msg)
@@ -129,9 +123,6 @@ func (s *dnsServer) handleDNS(ctx context.Context, w dns.ResponseWriter, req *dn
 }
 
 func (s *dnsServer) processRequest(ctx context.Context, req *dns.Msg) *dns.Msg {
-	if req == nil {
-		return nil
-	}
 	if req.Opcode != dns.OpcodeQuery || len(req.Question) == 0 {
 		msg := new(dns.Msg)
 		msg.SetRcode(req, dns.RcodeNotImplemented)
@@ -144,7 +135,7 @@ func (s *dnsServer) processRequest(ctx context.Context, req *dns.Msg) *dns.Msg {
 
 	for _, rule := range s.routes {
 		decision, ok := rule.Match(question)
-		if !ok || decision == nil {
+		if !ok {
 			continue
 		}
 		if len(decision.Records) > 0 {
@@ -199,7 +190,7 @@ func (s *dnsServer) processRequest(ctx context.Context, req *dns.Msg) *dns.Msg {
 	return nil
 }
 
-func (s *dnsServer) refresh(ctx context.Context, key string, req *dns.Msg, group outbound.IDnsOutbound) {
+func (s *dnsServer) refresh(ctx context.Context, key string, req *dns.Msg, group outbound.IDNSOutbound) {
 	if s.cache == nil {
 		return
 	}

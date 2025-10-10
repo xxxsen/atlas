@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 	"flag"
-	"fmt"
+	"log"
 	"os"
 	"os/signal"
 	"syscall"
@@ -27,8 +27,7 @@ func main() {
 	cfg, err := config.Load(*cfgPath)
 	if err != nil {
 		// logger not initialised yet, fallback to stderr
-		fmt.Fprintf(os.Stderr, "load config failed: %v\n", err)
-		os.Exit(1)
+		log.Fatalf("init config failed, err:%v", err)
 	}
 	logkit := logger.Init(cfg.Log.File, cfg.Log.Level, int(cfg.Log.FileCount),
 		int(cfg.Log.FileSize), int(cfg.Log.KeepDays), cfg.Log.Console)
@@ -38,16 +37,9 @@ func main() {
 	if err != nil {
 		logkit.Fatal("load data providers failed", zap.Error(err))
 	}
-
-	hostProviders, err := provider.LoadHostProviders(cfg.HostProviders)
-	if err != nil {
-		logkit.Fatal("load host providers failed", zap.Error(err))
-	}
-
-	outbound.SetHostData(hostProviders)
 	outboundManager := outbound.NewManager()
 	for _, ob := range cfg.Outbounds {
-		resolvers, err := outbound.CreateResolvers(ob.ServerList)
+		resolvers, err := outbound.MakeOutbounds(ob.ServerList)
 		if err != nil {
 			logkit.Fatal("initialise resolvers failed", zap.Error(err))
 		}
