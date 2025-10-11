@@ -1,6 +1,7 @@
 package resolver
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -210,17 +211,37 @@ func (c *cacheResolver) persist(ctx context.Context) {
 	if path == "" {
 		return
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
 		logutil.GetLogger(ctx).Error("create persist dir failed", zap.Error(err))
 		return
 	}
-	data, err := json.Marshal(snapshot)
+	tmpFile, err := os.OpenFile(path+".temp", os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0600)
 	if err != nil {
-		logutil.GetLogger(ctx).Error("marshal snapshot failed", zap.Error(err))
+		logutil.GetLogger(ctx).Error("create temp persist file failed", zap.Error(err))
 		return
 	}
-	if err := os.WriteFile(path, data, 0o644); err != nil {
-		logutil.GetLogger(ctx).Error("save persist dns cache file failed", zap.Error(err))
+	tmpPath := tmpFile.Name()
+	enc := json.NewEncoder(tmpFile)
+	writeErr := false
+	for _, rec := range snapshot {
+		if err := enc.Encode(rec); err != nil {
+			logutil.GetLogger(ctx).Error("write snapshot record failed", zap.Error(err))
+			writeErr = true
+			break
+		}
+	}
+	if err := tmpFile.Close(); err != nil {
+		logutil.GetLogger(ctx).Error("close temp persist file failed", zap.Error(err))
+		writeErr = true
+	}
+	if writeErr {
+		_ = os.Remove(tmpPath)
+		return
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		logutil.GetLogger(ctx).Error("replace persist dns cache file failed", zap.Error(err))
+		_ = os.Remove(tmpPath)
 		return
 	}
 	logutil.GetLogger(ctx).Debug("save persist dns cache file succ", zap.Int("record_count", len(snapshot)))
@@ -270,19 +291,27 @@ func (c *cacheResolver) loadFromFile() error {
 	if path == "" {
 		return nil
 	}
-	data, err := os.ReadFile(filepath.Clean(path))
+	file, err := os.Open(filepath.Clean(path))
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil
 		}
 		return err
 	}
-	var records []persistRecord
-	if err := json.Unmarshal(data, &records); err != nil {
-		return err
-	}
+	defer file.Close()
+	scanner := bufio.NewScanner(file)
+	buf := make([]byte, 0, 256*1024)
+	scanner.Buffer(buf, 1024*1024)
 	now := time.Now()
-	for _, rec := range records {
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		var rec persistRecord
+		if err := json.Unmarshal([]byte(line), &rec); err != nil {
+			continue
+		}
 		msg := &dns.Msg{}
 		if err := msg.Unpack(rec.Msg); err != nil {
 			continue
@@ -299,6 +328,9 @@ func (c *cacheResolver) loadFromFile() error {
 		c.mu.Lock()
 		c.cache.Add(rec.Key, entry)
 		c.mu.Unlock()
+	}
+	if err := scanner.Err(); err != nil {
+		return err
 	}
 	return nil
 }
