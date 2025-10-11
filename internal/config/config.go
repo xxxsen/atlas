@@ -13,7 +13,7 @@ import (
 type Config struct {
 	Bind     string           `json:"bind" yaml:"bind"`
 	Resource Resource         `json:"resource" yaml:"resource"`
-	Rules    []Rule           `json:"rules" yaml:"rules"`
+	Rule     []Rule           `json:"rule" yaml:"rule"`
 	Log      logger.LogConfig `json:"log" yaml:"log"`
 	Cache    CacheConfig      `json:"cache" yaml:"cache"`
 }

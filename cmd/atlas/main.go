@@ -24,7 +24,7 @@ import (
 )
 
 func main() {
-	cfgPath := flag.String("config", "", "path to JSON configuration file")
+	cfgPath := flag.String("config", "", "path to YAML configuration file")
 	flag.Parse()
 
 	cfg, err := config.Load(*cfgPath)
@@ -51,7 +51,7 @@ func main() {
 	if err != nil {
 		logkit.Fatal("build action map failed", zap.Error(err))
 	}
-	engine, err := buildRuleEngine(cfg.Rules, ms, as)
+	engine, err := buildRuleEngine(cfg.Rule, ms, as)
 	if err != nil {
 		logkit.Fatal("build rule engine failed", zap.Error(err))
 	}
