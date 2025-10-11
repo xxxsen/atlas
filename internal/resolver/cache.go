@@ -26,7 +26,7 @@ type CacheOptions struct {
 	File    string
 }
 
-const persistInterval = 5 * time.Minute
+const persistInterval = 1 * time.Minute
 
 var globalCacheOptions atomic.Value
 
@@ -100,15 +100,17 @@ func (c *cacheResolver) String() string {
 }
 
 func (c *cacheResolver) Query(ctx context.Context, req *dns.Msg) (*dns.Msg, error) {
-	key := buildCacheKey(req)
+	key := c.buildCacheKey(req)
 	msg, expired, found := c.get(key)
 	if found {
-		if !expired {
-			return msg, nil
-		}
 		msg.Id = req.Id
 		msg.Question = append([]dns.Question(nil), req.Question...)
+		if !expired {
+			logutil.GetLogger(ctx).Debug("read dns response from cache")
+			return msg, nil
+		}
 		if c.cfg.Lazy {
+			logutil.GetLogger(ctx).Debug("use expire dns response from cache, start refresh it")
 			c.scheduleRefresh(key, req.Copy())
 			return msg, nil
 		}
@@ -127,7 +129,7 @@ func (c *cacheResolver) get(key string) (*dns.Msg, bool, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	entry, ok := c.cache.Get(key)
-	if !ok || entry == nil {
+	if !ok {
 		return nil, false, false
 	}
 	copy := entry.msg.Copy()
@@ -136,7 +138,7 @@ func (c *cacheResolver) get(key string) (*dns.Msg, bool, bool) {
 	if remaining > 0 {
 		ttlSeconds = uint32(remaining / time.Second)
 	}
-	adjustTTL(copy, ttlSeconds)
+	c.adjustTTL(copy, ttlSeconds)
 	expired := time.Now().After(entry.expire)
 	return copy, expired, true
 }
@@ -152,8 +154,8 @@ func (c *cacheResolver) remove(key string) {
 }
 
 func (c *cacheResolver) store(key string, msg *dns.Msg) {
-	ttl, ok := extractTTL(msg)
-	if !ok || ttl == 0 || c.cache == nil {
+	ttl, ok := c.extractTTL(msg)
+	if !ok || ttl == 0 {
 		return
 	}
 	copy := msg.Copy()
@@ -250,9 +252,6 @@ func (c *cacheResolver) persistLoop() {
 	defer ticker.Stop()
 	ctx := context.Background()
 	for range ticker.C {
-		if !c.cfg.Persist {
-			continue
-		}
 		c.mu.Lock()
 		if !c.dirty {
 			c.mu.Unlock()
@@ -289,7 +288,7 @@ func (c *cacheResolver) loadFromFile() error {
 		if err := msg.Unpack(rec.Msg); err != nil {
 			continue
 		}
-		expire := time.Unix(rec.Expire/1000, rec.Expire*1000)
+		expire := time.UnixMilli(rec.Expire)
 		if expire.Before(now) && !c.cfg.Lazy { //已经过期了, 且没有懒加载, 则直接跳过
 			continue
 		}
@@ -305,7 +304,7 @@ func (c *cacheResolver) loadFromFile() error {
 	return nil
 }
 
-func buildCacheKey(req *dns.Msg) string {
+func (c *cacheResolver) buildCacheKey(req *dns.Msg) string {
 	if req == nil || len(req.Question) == 0 {
 		return ""
 	}
@@ -317,7 +316,7 @@ func buildCacheKey(req *dns.Msg) string {
 	return fmt.Sprintf("%s|%d|%d", domain, q.Qtype, q.Qclass)
 }
 
-func extractTTL(msg *dns.Msg) (uint32, bool) {
+func (c *cacheResolver) extractTTL(msg *dns.Msg) (uint32, bool) {
 	var minTTL uint32
 	found := false
 
@@ -346,7 +345,7 @@ func extractTTL(msg *dns.Msg) (uint32, bool) {
 	return minTTL, found
 }
 
-func adjustTTL(msg *dns.Msg, ttl uint32) {
+func (c *cacheResolver) adjustTTL(msg *dns.Msg, ttl uint32) {
 	for _, rr := range msg.Answer {
 		if rr.Header().Ttl > ttl {
 			rr.Header().Ttl = ttl
