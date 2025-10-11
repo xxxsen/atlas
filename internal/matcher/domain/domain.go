@@ -1,8 +1,10 @@
 package matcher
 
 import (
+	"bufio"
 	"context"
 	"fmt"
+	"os"
 	"regexp"
 	"strings"
 
@@ -97,9 +99,46 @@ func createDomainMatcher(name string, args interface{}) (matcher.IDNSMatcher, er
 	if err := utils.ConvStructJson(args, c); err != nil {
 		return nil, err
 	}
-	return newDomainMatcher(name, c.Domains)
+	domains := make([]string, 0, len(c.Domains))
+	domains = append(domains, c.Domains...)
+	fileDomains, err := loadDomainFiles(c.Files)
+	if err != nil {
+		return nil, err
+	}
+	domains = append(domains, fileDomains...)
+	return newDomainMatcher(name, domains)
 }
 
 func init() {
 	matcher.Register("domain", createDomainMatcher)
+}
+
+func loadDomainFiles(files []string) ([]string, error) {
+	var domains []string
+	for _, path := range files {
+		path = strings.TrimSpace(path)
+		if path == "" {
+			continue
+		}
+		f, err := os.Open(path)
+		if err != nil {
+			return nil, fmt.Errorf("open domain file %s: %w", path, err)
+		}
+		scanner := bufio.NewScanner(f)
+		for scanner.Scan() {
+			line := strings.TrimSpace(scanner.Text())
+			if line == "" || strings.HasPrefix(line, "#") {
+				continue
+			}
+			domains = append(domains, line)
+		}
+		if err := scanner.Err(); err != nil {
+			f.Close()
+			return nil, fmt.Errorf("read domain file %s: %w", path, err)
+		}
+		if err := f.Close(); err != nil {
+			return nil, fmt.Errorf("close domain file %s: %w", path, err)
+		}
+	}
+	return domains, nil
 }
