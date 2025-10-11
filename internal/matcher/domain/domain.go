@@ -48,19 +48,23 @@ func (d *domainMatcher) Match(ctx context.Context, req *dns.Msg) (bool, error) {
 	return false, nil
 }
 
+func (d *domainMatcher) extractKindData(in string) (string, string) {
+	if idx := strings.IndexByte(in, ':'); idx >= 0 {
+		kind := strings.ToLower(strings.TrimSpace(in[:idx]))
+		data := strings.TrimSpace(in[idx+1:])
+		return kind, data
+	}
+	return "suffix", strings.TrimSpace(in)
+}
+
 func (d *domainMatcher) init(drs []string) error {
 	for _, dr := range drs {
 		if len(dr) == 0 {
 			return fmt.Errorf("nil domain found")
 		}
-		items := strings.Split(dr, ":")
-		if len(items) != 2 {
-			return fmt.Errorf("invalid domain config")
-		}
-		kind := items[0]
-		data := strings.TrimSpace(items[1])
-		if data == "" {
-			return fmt.Errorf("empty domain value")
+		kind, data := d.extractKindData(dr)
+		if len(data) == 0 {
+			return fmt.Errorf("invalid rule:%s", dr)
 		}
 		normalized := strings.ToLower(matcher.NormalizeDomain(data))
 		switch kind {
