@@ -1,12 +1,12 @@
-package matcher
+package geosite
 
 import (
 	"fmt"
 	"strings"
 )
 
-func parseGeoSiteList(data []byte) (map[string][]geoDomain, error) {
-	result := make(map[string][]geoDomain)
+func parseGeoSiteList(data []byte) (map[string][]Domain, error) {
+	result := make(map[string][]Domain)
 	offset := 0
 	for offset < len(data) {
 		fieldNum, wireType, err := readTag(data, &offset)
@@ -37,7 +37,7 @@ func parseGeoSiteList(data []byte) (map[string][]geoDomain, error) {
 
 type geoSite struct {
 	name    string
-	domains []geoDomain
+	domains []Domain
 }
 
 func parseGeoSite(data []byte) (*geoSite, error) {
@@ -80,104 +80,108 @@ func parseGeoSite(data []byte) (*geoSite, error) {
 	return entry, nil
 }
 
-func parseGeoDomain(data []byte) (geoDomain, error) {
+func parseGeoDomain(data []byte) (Domain, error) {
 	offset := 0
-	result := geoDomain{
-		attributes: make(map[string]domainAttribute),
+	result := Domain{
+		Attributes: make(map[string]Attribute),
 	}
 	for offset < len(data) {
 		fieldNum, wireType, err := readTag(data, &offset)
 		if err != nil {
-			return geoDomain{}, err
+			return Domain{}, err
 		}
 		switch fieldNum {
 		case 1: // type
 			if wireType != wireTypeVarint {
-				return geoDomain{}, fmt.Errorf("unexpected wire type %d for Domain.type", wireType)
+				return Domain{}, fmt.Errorf("unexpected wire type %d for Domain.type", wireType)
 			}
 			val, err := readVarint(data, &offset)
 			if err != nil {
-				return geoDomain{}, err
+				return Domain{}, err
 			}
-			result.typ = int(val)
+			result.Type = DomainType(val)
 		case 2: // value
 			if wireType != wireTypeLengthDelimited {
-				return geoDomain{}, fmt.Errorf("unexpected wire type %d for Domain.value", wireType)
+				return Domain{}, fmt.Errorf("unexpected wire type %d for Domain.value", wireType)
 			}
 			str, err := readString(data, &offset)
 			if err != nil {
-				return geoDomain{}, err
+				return Domain{}, err
 			}
-			result.value = strings.TrimSpace(str)
+			if result.Type == DomainTypeRegex {
+				result.Value = strings.TrimSpace(str)
+			} else {
+				result.Value = strings.ToLower(strings.TrimSpace(str))
+			}
 		case 3: // attribute
 			if wireType != wireTypeLengthDelimited {
-				return geoDomain{}, fmt.Errorf("unexpected wire type %d for Domain.attribute", wireType)
+				return Domain{}, fmt.Errorf("unexpected wire type %d for Domain.attribute", wireType)
 			}
 			msg, err := readBytes(data, &offset)
 			if err != nil {
-				return geoDomain{}, err
+				return Domain{}, err
 			}
 			attr, key, err := parseDomainAttribute(msg)
 			if err != nil {
-				return geoDomain{}, err
+				return Domain{}, err
 			}
 			if key != "" {
-				result.attributes[key] = attr
+				result.Attributes[key] = attr
 			}
 		default:
 			if err := skipField(data, &offset, wireType); err != nil {
-				return geoDomain{}, err
+				return Domain{}, err
 			}
 		}
 	}
-	if result.value == "" {
-		return geoDomain{}, fmt.Errorf("empty domain value")
+	if result.Value == "" {
+		return Domain{}, fmt.Errorf("empty domain value")
 	}
 	return result, nil
 }
 
-func parseDomainAttribute(data []byte) (domainAttribute, string, error) {
+func parseDomainAttribute(data []byte) (Attribute, string, error) {
 	offset := 0
 	key := ""
-	attr := domainAttribute{}
+	attr := Attribute{}
 	for offset < len(data) {
 		fieldNum, wireType, err := readTag(data, &offset)
 		if err != nil {
-			return domainAttribute{}, "", err
+			return Attribute{}, "", err
 		}
 		switch fieldNum {
 		case 1:
 			if wireType != wireTypeLengthDelimited {
-				return domainAttribute{}, "", fmt.Errorf("unexpected wire type %d for Attribute.key", wireType)
+				return Attribute{}, "", fmt.Errorf("unexpected wire type %d for Attribute.key", wireType)
 			}
 			str, err := readString(data, &offset)
 			if err != nil {
-				return domainAttribute{}, "", err
+				return Attribute{}, "", err
 			}
 			key = strings.ToLower(strings.TrimSpace(str))
 		case 2:
 			if wireType != wireTypeVarint {
-				return domainAttribute{}, "", fmt.Errorf("unexpected wire type %d for Attribute.bool_value", wireType)
+				return Attribute{}, "", fmt.Errorf("unexpected wire type %d for Attribute.bool_value", wireType)
 			}
 			val, err := readVarint(data, &offset)
 			if err != nil {
-				return domainAttribute{}, "", err
+				return Attribute{}, "", err
 			}
 			boolean := val != 0
-			attr.boolValue = &boolean
+			attr.BoolValue = &boolean
 		case 3:
 			if wireType != wireTypeVarint {
-				return domainAttribute{}, "", fmt.Errorf("unexpected wire type %d for Attribute.int_value", wireType)
+				return Attribute{}, "", fmt.Errorf("unexpected wire type %d for Attribute.int_value", wireType)
 			}
 			val, err := readVarint(data, &offset)
 			if err != nil {
-				return domainAttribute{}, "", err
+				return Attribute{}, "", err
 			}
 			intVal := int64(val)
-			attr.intValue = &intVal
+			attr.IntValue = &intVal
 		default:
 			if err := skipField(data, &offset, wireType); err != nil {
-				return domainAttribute{}, "", err
+				return Attribute{}, "", err
 			}
 		}
 	}
@@ -263,14 +267,11 @@ func skipField(data []byte, offset *int, wireType int) error {
 		return nil
 	case wireTypeStartGroup:
 		for {
-			fieldNum, nextWire, err := readTag(data, offset)
+			_, nextWire, err := readTag(data, offset)
 			if err != nil {
 				return err
 			}
 			if nextWire == wireTypeEndGroup {
-				if fieldNum != 0 {
-					// Groups are deprecated; expect proper encoding.
-				}
 				return nil
 			}
 			if err := skipField(data, offset, nextWire); err != nil {

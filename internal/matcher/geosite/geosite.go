@@ -2,64 +2,45 @@ package matcher
 
 import (
 	"fmt"
-	"os"
 	"strings"
-	"sync"
 
+	geositeprovider "github.com/xxxsen/atlas/internal/data/geosite"
 	mainmatcher "github.com/xxxsen/atlas/internal/matcher"
 	"github.com/xxxsen/common/utils"
 )
 
-const (
-	geoDomainTypePlain  = 0
-	geoDomainTypeRegex  = 1
-	geoDomainTypeDomain = 2
-	geoDomainTypeFull   = 3
-)
-
-type geoDomain struct {
-	value      string
-	typ        int
-	attributes map[string]domainAttribute
-}
-
-type domainAttribute struct {
-	boolValue *bool
-	intValue  *int64
-}
-
-func (d geoDomain) toRule() (string, bool) {
-	switch d.typ {
-	case geoDomainTypePlain:
-		return "keyword:" + d.value, true
-	case geoDomainTypeRegex:
-		return "regexp:" + d.value, true
-	case geoDomainTypeDomain:
-		return "suffix:" + d.value, true
-	case geoDomainTypeFull:
-		return "full:" + d.value, true
+func domainToRule(d geositeprovider.Domain) (string, bool) {
+	switch d.Type {
+	case geositeprovider.DomainTypePlain:
+		return "keyword:" + d.Value, true
+	case geositeprovider.DomainTypeRegex:
+		return "regexp:" + d.Value, true
+	case geositeprovider.DomainTypeDomain:
+		return "suffix:" + d.Value, true
+	case geositeprovider.DomainTypeFull:
+		return "full:" + d.Value, true
 	default:
 		return "", false
 	}
 }
 
-func (d geoDomain) matchesAttribute(attr string, negate bool) bool {
+func matchesAttribute(attrs map[string]geositeprovider.Attribute, attr string, negate bool) bool {
 	if attr == "" {
 		return true
 	}
-	val, ok := d.attributes[attr]
+	val, ok := attrs[attr]
 	if !ok {
 		return negate
 	}
-	if val.boolValue != nil {
-		has := *val.boolValue
+	if val.BoolValue != nil {
+		has := *val.BoolValue
 		if negate {
 			return !has
 		}
 		return has
 	}
-	if val.intValue != nil {
-		has := *val.intValue != 0
+	if val.IntValue != nil {
+		has := *val.IntValue != 0
 		if negate {
 			return !has
 		}
@@ -93,24 +74,6 @@ func parseListSpec(spec string) listSpec {
 	}
 }
 
-var geositeCache sync.Map // map[string]map[string][]geoDomain
-
-func loadGeositeFile(path string) (map[string][]geoDomain, error) {
-	if cached, ok := geositeCache.Load(path); ok {
-		return cached.(map[string][]geoDomain), nil
-	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, fmt.Errorf("read geosite file %s: %w", path, err)
-	}
-	parsed, err := parseGeoSiteList(data)
-	if err != nil {
-		return nil, fmt.Errorf("parse geosite file %s: %w", path, err)
-	}
-	geositeCache.Store(path, parsed)
-	return parsed, nil
-}
-
 func createGeositeMatcher(name string, args interface{}) (mainmatcher.IDNSMatcher, error) {
 	cfg := &config{}
 	if err := utils.ConvStructJson(args, cfg); err != nil {
@@ -122,10 +85,12 @@ func createGeositeMatcher(name string, args interface{}) (mainmatcher.IDNSMatche
 	if len(cfg.Categories) == 0 {
 		return nil, fmt.Errorf("geosite matcher requires categories")
 	}
-	entries, err := loadGeositeFile(cfg.File)
+
+	data, err := geositeprovider.GeositeProvider.Load(cfg.File)
 	if err != nil {
 		return nil, err
 	}
+
 	var domainRules []string
 	seen := make(map[string]struct{})
 	for _, rawSpec := range cfg.Categories {
@@ -133,15 +98,15 @@ func createGeositeMatcher(name string, args interface{}) (mainmatcher.IDNSMatche
 		if spec.name == "" {
 			continue
 		}
-		domains, ok := entries[spec.name]
+		domains, ok := data.Domains(spec.name)
 		if !ok {
-			return nil, fmt.Errorf("geosite list %s not found", spec.name)
+			return nil, fmt.Errorf("geosite category %s not found", spec.name)
 		}
 		for _, domain := range domains {
-			if !domain.matchesAttribute(spec.attr, spec.attrNegate) {
+			if !matchesAttribute(domain.Attributes, spec.attr, spec.attrNegate) {
 				continue
 			}
-			if rule, ok := domain.toRule(); ok {
+			if rule, ok := domainToRule(domain); ok {
 				if _, exists := seen[rule]; exists {
 					continue
 				}
@@ -153,10 +118,10 @@ func createGeositeMatcher(name string, args interface{}) (mainmatcher.IDNSMatche
 	if len(domainRules) == 0 {
 		return nil, fmt.Errorf("geosite matcher produced no domains")
 	}
-	data := map[string]interface{}{
+	dataMap := map[string]interface{}{
 		"domains": domainRules,
 	}
-	return mainmatcher.MakeMatcher("domain", name, data)
+	return mainmatcher.MakeMatcher("domain", name, dataMap)
 }
 
 func init() {
