@@ -11,7 +11,6 @@ import (
 
 type rcodeAction struct {
 	name  string
-	typ   string
 	rcode int
 }
 
