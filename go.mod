@@ -7,7 +7,7 @@ toolchain go1.24.1
 require (
 	github.com/hashicorp/golang-lru/v2 v2.0.7
 	github.com/miekg/dns v1.1.55
-	github.com/xxxsen/common v0.1.26
+	github.com/xxxsen/common v0.1.27
 	go.uber.org/zap v1.24.0
 	golang.org/x/sync v0.12.0
 	gopkg.in/yaml.v3 v3.0.1
