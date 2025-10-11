@@ -2,11 +2,11 @@ package model
 
 import "net/url"
 
-type BasicResolverParam struct {
+type BasicParam struct {
 	Timeout int64 `schema:"timeout"`
 }
 
-type ResolverParams struct {
+type Params struct {
 	URL          *url.URL
-	CustomParams BasicResolverParam
+	CustomParams BasicParam
 }

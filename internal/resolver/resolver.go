@@ -1,7 +1,7 @@
-package outbound
+package resolver
 
 import (
-	"atlas/internal/outbound/model"
+	"atlas/internal/resolver/model"
 	"context"
 	"fmt"
 	"net/url"
@@ -10,14 +10,14 @@ import (
 	"github.com/miekg/dns"
 )
 
-type Factory func(schema string, host string, params *model.ResolverParams) (IDNSResolver, error)
+type Factory func(schema string, host string, params *model.Params) (IDNSResolver, error)
 
 var m = make(map[string]Factory)
 
-func MakeOutbounds(links []string) ([]IDNSResolver, error) {
+func MakeResolvers(links []string) ([]IDNSResolver, error) {
 	rs := make([]IDNSResolver, 0, len(links))
 	for _, item := range links {
-		r, err := MakeOutbound(item)
+		r, err := MakeResolver(item)
 		if err != nil {
 			return nil, err
 		}
@@ -26,7 +26,7 @@ func MakeOutbounds(links []string) ([]IDNSResolver, error) {
 	return rs, nil
 }
 
-func MakeOutbound(link string) (IDNSResolver, error) {
+func MakeResolver(link string) (IDNSResolver, error) {
 	uri, err := url.Parse(link)
 	if err != nil {
 		return nil, err
@@ -35,7 +35,7 @@ func MakeOutbound(link string) (IDNSResolver, error) {
 	if !ok {
 		return nil, fmt.Errorf("no resolver type found, type:%s", uri.Scheme)
 	}
-	urlinfo := &model.ResolverParams{
+	urlinfo := &model.Params{
 		URL: uri,
 	}
 	if err := decodeParams(&urlinfo.CustomParams, uri.Query()); err != nil {
@@ -55,11 +55,6 @@ func decodeParams(out interface{}, in map[string][]string) error {
 
 func Register(schema string, fac Factory) {
 	m[schema] = fac
-}
-
-// IDNSOutbound represents a DNS outbound transport abstraction.
-type IDNSOutbound interface {
-	Query(ctx context.Context, req *dns.Msg) (*dns.Msg, error)
 }
 
 // IDNSResolver represents a downstream resolver.

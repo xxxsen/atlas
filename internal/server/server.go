@@ -3,16 +3,13 @@ package server
 import (
 	"context"
 	"fmt"
-	"strings"
-	"time"
+	"strconv"
+	"sync/atomic"
 
 	"github.com/miekg/dns"
 	"github.com/xxxsen/common/logutil"
+	"github.com/xxxsen/common/trace"
 	"go.uber.org/zap"
-
-	"atlas/internal/cache"
-	"atlas/internal/outbound"
-	"atlas/internal/routing"
 )
 
 // IDNSServer exposes the DNS server behaviour.
@@ -21,59 +18,41 @@ type IDNSServer interface {
 }
 
 type dnsServer struct {
-	bind         string
-	udpServer    *dns.Server
-	tcpServer    *dns.Server
-	outbounds    outbound.IOutboundManager
-	routes       []routing.IRouteRule
-	cache        cache.IDNSCache
-	cacheEnabled bool
-	timeout      time.Duration
+	c         *options
+	udpServer *dns.Server
+	tcpServer *dns.Server
+	tid       uint64
 }
 
 // New creates a DNS forwarder server using the supplied configuration.
 func New(opts ...Option) (IDNSServer, error) {
-	cfg := options{
-		bind:    ":5353",
-		timeout: 6 * time.Second,
+	cfg := &options{
+		bind: ":5353",
 	}
 	for _, opt := range opts {
-		if opt != nil {
-			opt(&cfg)
-		}
+		opt(cfg)
 	}
-	if cfg.manager == nil {
-		return nil, fmt.Errorf("outbound manager is required")
-	}
-	if len(cfg.routes) == 0 {
-		return nil, fmt.Errorf("routing rules are required")
+	if cfg.re == nil {
+		return nil, fmt.Errorf("no rule engine found")
 	}
 
 	s := &dnsServer{
-		bind:         cfg.bind,
-		outbounds:    cfg.manager,
-		routes:       cfg.routes,
-		cache:        cfg.cache,
-		cacheEnabled: cfg.cache != nil,
-		timeout:      cfg.timeout,
+		c: cfg,
 	}
 	return s, nil
 }
 
 // Start begins listening on both UDP and TCP.
 func (s *dnsServer) Start(ctx context.Context) error {
-	if s.outbounds == nil {
-		return fmt.Errorf("outbound manager not initialised")
-	}
 	s.udpServer = &dns.Server{
-		Addr: s.bind,
+		Addr: s.c.bind,
 		Net:  "udp",
 		Handler: dns.HandlerFunc(func(w dns.ResponseWriter, req *dns.Msg) {
 			s.handleDNS(ctx, w, req)
 		}),
 	}
 	s.tcpServer = &dns.Server{
-		Addr: s.bind,
+		Addr: s.c.bind,
 		Net:  "tcp",
 		Handler: dns.HandlerFunc(func(w dns.ResponseWriter, req *dns.Msg) {
 			s.handleDNS(ctx, w, req)
@@ -103,139 +82,34 @@ func (s *dnsServer) shutdown() {
 }
 
 func (s *dnsServer) handleDNS(ctx context.Context, w dns.ResponseWriter, req *dns.Msg) {
-	log := logutil.GetLogger(ctx)
-	resp := s.processRequest(ctx, req)
-	if resp == nil {
+	tid := atomic.AddUint64(&s.tid, 1)
+	ctx = trace.WithTraceId(ctx, strconv.FormatUint(tid, 10))
+	logger := logutil.GetLogger(ctx)
+	resp, err := s.processRequest(ctx, req)
+	if err != nil {
+		logger.Error("process dns request failed", zap.Error(err))
 		resp = new(dns.Msg)
 		resp.SetRcode(req, dns.RcodeServerFailure)
+		return
 	}
-	if len(resp.Question) == 0 {
-		resp.Question = req.Question
-	}
-	resp.Id = req.Id
-	resp.RecursionAvailable = true
-	resp.Compress = true
-
 	if err := w.WriteMsg(resp); err != nil {
-		log.Error("write response failed", zap.Error(err))
+		logger.Error("write response failed", zap.Error(err))
+		return
 	}
-	log.Debug("response sent to client", zap.String("question", questionName(resp)))
+	logger.Debug("response sent to client succ")
 }
 
-func (s *dnsServer) processRequest(ctx context.Context, req *dns.Msg) *dns.Msg {
+func (s *dnsServer) processRequest(ctx context.Context, req *dns.Msg) (*dns.Msg, error) {
 	if req.Opcode != dns.OpcodeQuery || len(req.Question) == 0 {
-		msg := new(dns.Msg)
-		msg.SetRcode(req, dns.RcodeNotImplemented)
-		return msg
+		return nil, fmt.Errorf("invalid dns request, may be not implment yet")
 	}
 	question := req.Question[0]
-	key := cacheKey(question)
-	log := logutil.GetLogger(ctx)
-	log.Debug("processing dns question", zap.String("question", questionName(req)))
+	logger := logutil.GetLogger(ctx)
+	logger.Debug("recv dns request", zap.String("domain", question.Name), zap.Uint16("qtype", question.Qtype))
 
-	for _, rule := range s.routes {
-		decision, ok := rule.Match(question)
-		if !ok {
-			continue
-		}
-		if len(decision.Records) > 0 {
-			reply := new(dns.Msg)
-			reply.SetReply(req)
-			reply.Answer = append(reply.Answer, cloneRecords(decision.Records)...)
-			log.Info("served response from static records", zap.String("question", questionName(req)), zap.Int("answer_count", len(reply.Answer)))
-			return reply
-		}
-		if decision.OutboundTag == "" {
-			continue
-		}
-		group, ok := s.outbounds.Get(decision.OutboundTag)
-		if !ok {
-			log.Warn("no outbound found for tag", zap.String("tag", decision.OutboundTag))
-			continue
-		}
-		log.Debug("route matched outbound", zap.String("tag", decision.OutboundTag), zap.String("question", questionName(req)))
-
-		// Cache lookup
-		if s.cacheEnabled && decision.Cacheable {
-			if res, found := s.cache.Get(key); found && res.Msg != nil {
-				reply := res.Msg.Copy()
-				reply.Question = req.Question
-				log.Debug("cache hit for question", zap.String("question", questionName(req)), zap.Bool("stale", res.Expired))
-				if res.ShouldRefresh {
-					log.Debug("scheduling cache refresh", zap.String("question", questionName(req)))
-					go s.refresh(ctx, key, req, group)
-				}
-				return reply
-			}
-			log.Debug("cache miss for question", zap.String("question", questionName(req)))
-		}
-
-		ctxTimeout, cancel := context.WithTimeout(ctx, s.timeout)
-		resp, err := group.Query(ctxTimeout, cloneRequest(req))
-		cancel()
-		if err != nil {
-			logutil.GetLogger(ctx).Error("query outbound failed", zap.String("tag", decision.OutboundTag), zap.Error(err))
-			continue
-		}
-		resp.Question = req.Question
-		if s.cacheEnabled && decision.Cacheable {
-			s.cache.Set(key, resp)
-			log.Debug("cached outbound response", zap.String("question", questionName(req)))
-		}
-		log.Info("forwarded response from outbound", zap.String("tag", decision.OutboundTag), zap.String("question", questionName(req)))
-		return resp
-	}
-
-	log.Warn("no routing rule matched question", zap.String("question", questionName(req)))
-	return nil
-}
-
-func (s *dnsServer) refresh(ctx context.Context, key string, req *dns.Msg, group outbound.IDNSOutbound) {
-	if s.cache == nil {
-		return
-	}
-	ctxTimeout, cancel := context.WithTimeout(ctx, s.timeout)
-	defer cancel()
-	resp, err := group.Query(ctxTimeout, cloneRequest(req))
+	rsp, err := s.c.re.Execute(ctx, req)
 	if err != nil {
-		logutil.GetLogger(ctx).Warn("lazy refresh failed", zap.String("key", key), zap.Error(err))
-		s.cache.MarkRefreshComplete(key)
-		return
+		return nil, err
 	}
-	resp.Question = req.Question
-	s.cache.Set(key, resp)
-	logutil.GetLogger(ctx).Debug("cache refreshed", zap.String("question", questionName(req)))
-}
-
-func cloneRecords(records []dns.RR) []dns.RR {
-	if len(records) == 0 {
-		return nil
-	}
-	cloned := make([]dns.RR, 0, len(records))
-	for _, rr := range records {
-		if rr == nil {
-			continue
-		}
-		cloned = append(cloned, dns.Copy(rr))
-	}
-	return cloned
-}
-
-func cloneRequest(req *dns.Msg) *dns.Msg {
-	if req == nil {
-		return nil
-	}
-	return req.Copy()
-}
-
-func cacheKey(question dns.Question) string {
-	name := strings.ToLower(strings.TrimSuffix(question.Name, "."))
-	return fmt.Sprintf("%s:%d:%d", name, question.Qtype, question.Qclass)
-}
-
-func questionName(msg *dns.Msg) string {
-	if msg == nil || len(msg.Question) == 0 {
-		return ""
-	}
-	return strings.TrimSuffix(msg.Question[0].Name, ".")
+	return rsp, nil
 }

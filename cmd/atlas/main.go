@@ -4,16 +4,18 @@ import (
 	"context"
 	"errors"
 	"flag"
+	"fmt"
 	"log"
 	"os"
 	"os/signal"
 	"syscall"
 
-	"atlas/internal/cache"
+	"atlas/internal/action"
+	_ "atlas/internal/action/register"
 	"atlas/internal/config"
-	"atlas/internal/outbound"
-	"atlas/internal/provider"
-	"atlas/internal/routing"
+	"atlas/internal/matcher"
+	_ "atlas/internal/matcher/register"
+	"atlas/internal/rule"
 	"atlas/internal/server"
 
 	"github.com/xxxsen/common/logger"
@@ -33,38 +35,22 @@ func main() {
 		int(cfg.Log.FileSize), int(cfg.Log.KeepDays), cfg.Log.Console)
 	defer logkit.Sync() //nolint:errcheck
 
-	domainProviders, err := provider.LoadProviders(cfg.DataProviders)
+	ms, err := buildMatcherMap(cfg.Resource.Matcher)
 	if err != nil {
-		logkit.Fatal("load data providers failed", zap.Error(err))
+		logkit.Fatal("build matcher map failed", zap.Error(err))
 	}
-	outboundManager := outbound.NewManager()
-	for _, ob := range cfg.Outbounds {
-		resolvers, err := outbound.MakeOutbounds(ob.ServerList)
-		if err != nil {
-			logkit.Fatal("initialise resolvers failed", zap.Error(err))
-		}
-		if err := outboundManager.AddOutbound(ob.Tag, resolvers, ob.Parallel); err != nil {
-			logkit.Fatal("initialise outbounds failed", zap.Error(err))
-		}
-	}
-
-	rules, err := routing.BuildRules(cfg.Routes, domainProviders)
+	as, err := buildActionMap(cfg.Resource.Action)
 	if err != nil {
-		logkit.Fatal("initialise routing rules failed", zap.Error(err))
+		logkit.Fatal("build action map failed", zap.Error(err))
 	}
-
-	var responseCache *cache.Cache
-	if cfg.Cache.Size > 0 {
-		responseCache = cache.New(cfg.Cache.Size, cfg.Cache.Lazy)
+	engine, err := buildRuleEngine(cfg.Rules, ms, as)
+	if err != nil {
+		logkit.Fatal("build rule engine failed", zap.Error(err))
 	}
 
 	serverOpts := []server.Option{
 		server.WithBind(cfg.Bind),
-		server.WithOutboundManager(outboundManager),
-		server.WithRoutes(rules),
-	}
-	if responseCache != nil {
-		serverOpts = append(serverOpts, server.WithCache(responseCache))
+		server.WithRuleEngine(engine),
 	}
 
 	forwarder, err := server.New(serverOpts...)
@@ -80,4 +66,49 @@ func main() {
 		logkit.Fatal("server error", zap.Error(err))
 	}
 	logkit.Info("shutdown complete")
+}
+
+func buildActionMap(ats []config.ActionConfig) (map[string]action.IDNSAction, error) {
+	m := make(map[string]action.IDNSAction, len(ats))
+	for _, at := range ats {
+		inst, err := action.MakeAction(at.Type, at.Name, at.Data)
+		if err != nil {
+			return nil, fmt.Errorf("make action failed, name:%s, type:%s, err:%w", at.Name, at.Type, err)
+		}
+		m[at.Name] = inst
+	}
+	return m, nil
+}
+
+func buildMatcherMap(ms []config.MatcherConfig) (map[string]matcher.IDNSMatcher, error) {
+	rs := make(map[string]matcher.IDNSMatcher, len(ms))
+	for _, m := range ms {
+		inst, err := matcher.MakeMatcher(m.Type, m.Name, m.Data)
+		if err != nil {
+			return nil, err
+		}
+		rs[m.Name] = inst
+	}
+	return rs, nil
+}
+
+func buildRuleEngine(rules []config.Rule, mat map[string]matcher.IDNSMatcher, atm map[string]action.IDNSAction) (rule.IDNSRuleEngine, error) {
+	rs := make([]rule.IDNSRule, 0, len(rules))
+	for idx, r := range rules {
+		m, ok := mat[r.Match]
+		if !ok {
+			return nil, fmt.Errorf("matcher not found, name:%s", r.Match)
+		}
+		a, ok := atm[r.Action]
+		if !ok {
+			return nil, fmt.Errorf("action not found, name:%s", r.Action)
+		}
+		remark := r.Remark
+		if len(remark) == 0 {
+			remark = fmt.Sprintf("rule:%d", idx)
+		}
+		inst := rule.NewRule(remark, m, a)
+		rs = append(rs, inst)
+	}
+	return rule.NewEngine(rs...), nil
 }

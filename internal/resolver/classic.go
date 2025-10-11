@@ -1,7 +1,7 @@
-package outbound
+package resolver
 
 import (
-	"atlas/internal/outbound/model"
+	"atlas/internal/resolver/model"
 	"context"
 	"crypto/tls"
 	"fmt"
@@ -17,7 +17,7 @@ func init() {
 	Register("dot", basicResolverFactory)
 }
 
-func basicResolverFactory(schema string, host string, params *model.ResolverParams) (IDNSResolver, error) {
+func basicResolverFactory(schema string, host string, params *model.Params) (IDNSResolver, error) {
 	if schema == "udp" || schema == "tcp" {
 		client := &dns.Client{Net: schema, Timeout: time.Duration(params.CustomParams.Timeout) * time.Millisecond}
 		return &classicResolver{
