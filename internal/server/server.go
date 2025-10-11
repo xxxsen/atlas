@@ -112,10 +112,10 @@ func (s *dnsServer) handleDNS(ctx context.Context, w dns.ResponseWriter, req *dn
 		logger.Error("write response to client failed", zap.Error(err))
 		return
 	}
-	logger.Info("handle dns request finish", zap.Bool("succ", succ), zap.String("ips", summariseIPs(resp)))
+	logger.Info("handle dns request finish", zap.Bool("succ", succ), zap.String("ips", s.summariseIPs(resp)))
 }
 
-func summariseIPs(msg *dns.Msg) string {
+func (s *dnsServer) summariseIPs(msg *dns.Msg) string {
 	addrs := make([]string, 0, len(msg.Answer))
 	for _, rr := range msg.Answer {
 		switch rec := rr.(type) {
@@ -128,8 +128,8 @@ func summariseIPs(msg *dns.Msg) string {
 	if len(addrs) == 0 {
 		return ""
 	}
-	if len(addrs) > 2 {
-		addrs = append(addrs[:2], "...")
+	if len(addrs) > 3 {
+		addrs = append(addrs[:3], "...")
 	}
 	return strings.Join(addrs, ",")
 }

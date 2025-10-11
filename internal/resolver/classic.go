@@ -10,6 +10,8 @@ import (
 
 	"github.com/miekg/dns"
 	"github.com/xxxsen/atlas/internal/resolver/model"
+	"github.com/xxxsen/common/logutil"
+	"go.uber.org/zap"
 )
 
 func init() {
@@ -57,30 +59,28 @@ type classicResolver struct {
 }
 
 func (r *classicResolver) String() string {
-	if r == nil {
-		return ""
-	}
 	return fmt.Sprintf("%s/%s", r.client.Net, r.addr)
 }
 
 func (r *classicResolver) Query(ctx context.Context, req *dns.Msg) (*dns.Msg, error) {
-	if r == nil || r.client == nil {
-		return nil, fmt.Errorf("resolver not initialised")
-	}
 	return r.exchangeContext(ctx, r.client, req, r.addr)
 }
 
 func (r *classicResolver) exchangeContext(ctx context.Context, client *dns.Client, req *dns.Msg, addr string) (*dns.Msg, error) {
-	if client == nil {
-		return nil, fmt.Errorf("dns client is nil")
-	}
+	logger := logutil.GetLogger(ctx).With(
+		zap.String("resolver", r.String()),
+		zap.String("server_addr", addr),
+	)
+	logger.Debug("classic resolver start query")
 	resp, _, err := client.ExchangeContext(ctx, req, addr)
 	if err != nil {
+		logger.Error("classic resolver query failed", zap.Error(err))
 		return nil, err
 	}
 	if resp == nil {
 		return nil, fmt.Errorf("no response from %s", addr)
 	}
+	logger.Debug("classic resolver query success", zap.Int("answer_count", len(resp.Answer)))
 	return resp, nil
 }
 

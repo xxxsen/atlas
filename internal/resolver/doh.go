@@ -13,6 +13,8 @@ import (
 
 	"github.com/miekg/dns"
 	"github.com/xxxsen/atlas/internal/resolver/model"
+	"github.com/xxxsen/common/logutil"
+	"go.uber.org/zap"
 )
 
 func init() {
@@ -60,10 +62,8 @@ func (r *dohResolver) String() string {
 }
 
 func (r *dohResolver) Query(ctx context.Context, req *dns.Msg) (*dns.Msg, error) {
-	if r == nil || r.client == nil {
-		return nil, fmt.Errorf("invalid doh resolver")
-	}
-
+	logger := logutil.GetLogger(ctx).With(zap.String("resolver", r.String()))
+	logger.Debug("doh resolver start query")
 	payload, err := req.Pack()
 	if err != nil {
 		return nil, fmt.Errorf("pack dns request: %w", err)
@@ -78,6 +78,7 @@ func (r *dohResolver) Query(ctx context.Context, req *dns.Msg) (*dns.Msg, error)
 
 	resp, err := r.client.Do(httpReq)
 	if err != nil {
+		logger.Error("doh resolver request failed", zap.Error(err))
 		return nil, fmt.Errorf("doh request: %w", err)
 	}
 	defer resp.Body.Close()
@@ -96,5 +97,6 @@ func (r *dohResolver) Query(ctx context.Context, req *dns.Msg) (*dns.Msg, error)
 	if err := message.Unpack(body); err != nil {
 		return nil, fmt.Errorf("decode doh response: %w", err)
 	}
+	logger.Debug("doh resolver query success", zap.Int("answer_count", len(message.Answer)))
 	return message, nil
 }

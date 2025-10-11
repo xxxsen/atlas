@@ -6,7 +6,9 @@ import (
 	"github.com/miekg/dns"
 	"github.com/xxxsen/atlas/internal/action"
 	"github.com/xxxsen/atlas/internal/resolver"
+	"github.com/xxxsen/common/logutil"
 	"github.com/xxxsen/common/utils"
+	"go.uber.org/zap"
 )
 
 type forwardAction struct {
@@ -19,7 +21,19 @@ func (f *forwardAction) Name() string {
 }
 
 func (f *forwardAction) Perform(ctx context.Context, req *dns.Msg) (*dns.Msg, error) {
-	return f.r.Query(ctx, req)
+	logger := logutil.GetLogger(ctx).With(zap.String("action", f.name), zap.String("target_resolver", f.r.String()))
+	logger.Debug("forward action start")
+	resp, err := f.r.Query(ctx, req)
+	if err != nil {
+		logger.Error("forward action query failed", zap.Error(err))
+		return nil, err
+	}
+	ans := 0
+	if resp != nil {
+		ans = len(resp.Answer)
+	}
+	logger.Debug("forward action query success", zap.Int("answer_count", ans))
+	return resp, nil
 }
 
 func (h *forwardAction) Type() string {
