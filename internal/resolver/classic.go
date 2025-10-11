@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"fmt"
 	"net"
+	"strings"
 	"time"
 
 	"github.com/miekg/dns"
@@ -19,13 +20,21 @@ func init() {
 
 func basicResolverFactory(schema string, host string, params *model.Params) (IDNSResolver, error) {
 	if schema == "udp" || schema == "tcp" {
+		addr, err := ensurePort(host, "53")
+		if err != nil {
+			return nil, err
+		}
 		client := &dns.Client{Net: schema, Timeout: time.Duration(params.CustomParams.Timeout) * time.Millisecond}
 		return &classicResolver{
-			addr:   host,
+			addr:   addr,
 			client: client,
 		}, nil
 	} else if schema == "dot" {
-		hostname, _, err := net.SplitHostPort(host)
+		addr, err := ensurePort(host, "853")
+		if err != nil {
+			return nil, err
+		}
+		hostname, _, err := net.SplitHostPort(addr)
 		if err != nil {
 			return nil, err
 		}
@@ -37,7 +46,7 @@ func basicResolverFactory(schema string, host string, params *model.Params) (IDN
 				MinVersion: tls.VersionTLS12,
 			},
 		}
-		return &classicResolver{addr: host, client: client}, nil
+		return &classicResolver{addr: addr, client: client}, nil
 	}
 	return nil, fmt.Errorf("unsupported dns type:%s", schema)
 }
@@ -73,4 +82,19 @@ func (r *classicResolver) exchangeContext(ctx context.Context, client *dns.Clien
 		return nil, fmt.Errorf("no response from %s", addr)
 	}
 	return resp, nil
+}
+
+func ensurePort(host string, defaultPort string) (string, error) {
+	if defaultPort == "" {
+		return host, nil
+	}
+	if _, _, err := net.SplitHostPort(host); err == nil {
+		return host, nil
+	}
+	cleanHost := host
+	if strings.HasPrefix(cleanHost, "[") && strings.HasSuffix(cleanHost, "]") {
+		cleanHost = strings.TrimPrefix(cleanHost, "[")
+		cleanHost = strings.TrimSuffix(cleanHost, "]")
+	}
+	return net.JoinHostPort(cleanHost, defaultPort), nil
 }
