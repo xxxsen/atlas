@@ -146,7 +146,7 @@ func createHostAction(name string, args interface{}) (action.IDNSAction, error) 
 			return nil, fmt.Errorf("host action:%s unsupported ip:%s", name, addr)
 		}
 		if len(entry.ipv4) == 0 && len(entry.ipv6) == 0 {
-			return nil, fmt.Errorf("host action:%s has no valid ip for domain:%s", name, domain)
+			continue
 		}
 		records[domain] = entry
 	}
