@@ -23,10 +23,6 @@ func (a *rcodeAction) Type() string {
 }
 
 func (a *rcodeAction) Perform(ctx context.Context, req *dns.Msg) (*dns.Msg, error) {
-	if req == nil {
-		return nil, fmt.Errorf("dns request is nil")
-	}
-
 	resp := new(dns.Msg)
 	resp.SetReply(req)
 	resp.Authoritative = true
