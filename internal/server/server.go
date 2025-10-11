@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -111,7 +112,26 @@ func (s *dnsServer) handleDNS(ctx context.Context, w dns.ResponseWriter, req *dn
 		logger.Error("write response to client failed", zap.Error(err))
 		return
 	}
-	logger.Info("handle dns request finish", zap.Bool("succ", succ))
+	logger.Info("handle dns request finish", zap.Bool("succ", succ), zap.String("ips", summariseIPs(resp)))
+}
+
+func summariseIPs(msg *dns.Msg) string {
+	addrs := make([]string, 0, len(msg.Answer))
+	for _, rr := range msg.Answer {
+		switch rec := rr.(type) {
+		case *dns.A:
+			addrs = append(addrs, rec.A.String())
+		case *dns.AAAA:
+			addrs = append(addrs, rec.AAAA.String())
+		}
+	}
+	if len(addrs) == 0 {
+		return ""
+	}
+	if len(addrs) > 2 {
+		addrs = append(addrs[:2], "...")
+	}
+	return strings.Join(addrs, ",")
 }
 
 func (s *dnsServer) processRequest(ctx context.Context, req *dns.Msg) (*dns.Msg, error) {
