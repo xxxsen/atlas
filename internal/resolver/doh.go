@@ -20,13 +20,16 @@ func init() {
 }
 
 func dohResolverFactory(schema string, host string, params *model.Params) (IDNSResolver, error) {
-	endpoint := fmt.Sprintf("%s://%s%s", schema, host, params.URL.RawPath)
+	path := params.URL.EscapedPath()
+	if path == "" {
+		path = "/"
+	}
+	endpoint := fmt.Sprintf("%s://%s%s", schema, host, path)
 	return newDoHResolver(endpoint, time.Duration(params.CustomParams.Timeout)*time.Millisecond)
 }
 
 func newDoHResolver(endpoint string, timeout time.Duration) (IDNSResolver, error) {
 	transport := &http.Transport{
-		Proxy:               http.ProxyFromEnvironment,
 		MaxConnsPerHost:     10,
 		MaxIdleConns:        10,
 		IdleConnTimeout:     30 * time.Second,
