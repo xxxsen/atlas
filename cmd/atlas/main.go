@@ -15,6 +15,7 @@ import (
 	"github.com/xxxsen/atlas/internal/config"
 	"github.com/xxxsen/atlas/internal/matcher"
 	_ "github.com/xxxsen/atlas/internal/matcher/register"
+	"github.com/xxxsen/atlas/internal/resolver"
 	"github.com/xxxsen/atlas/internal/rule"
 	"github.com/xxxsen/atlas/internal/server"
 	"github.com/xxxsen/common/logger"
@@ -33,6 +34,13 @@ func main() {
 	logkit := logger.Init(cfg.Log.File, cfg.Log.Level, int(cfg.Log.FileCount),
 		int(cfg.Log.FileSize), int(cfg.Log.KeepDays), cfg.Log.Console)
 	defer logkit.Sync() //nolint:errcheck
+
+	resolver.ConfigureCache(resolver.CacheOptions{
+		Size:    cfg.Cache.Size,
+		Lazy:    cfg.Cache.Lazy,
+		Persist: cfg.Cache.Persist,
+		File:    cfg.Cache.File,
+	})
 
 	ms, err := buildMatcherMap(cfg.Resource.Matcher)
 	if err != nil {
