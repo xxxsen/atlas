@@ -16,7 +16,7 @@ import (
 type domainMatcher struct {
 	name   string
 	full   map[string]struct{}
-	suffix []string
+	suffix *suffixNode
 	kw     []string
 	reg    []*regexp.Regexp
 }
@@ -30,17 +30,12 @@ func (d *domainMatcher) Type() string {
 }
 
 func (d *domainMatcher) Match(ctx context.Context, req *dns.Msg) (bool, error) {
-	name := matcher.NormalizeDomain(req.Question[0].Name)
+	name := strings.ToLower(matcher.NormalizeDomain(req.Question[0].Name))
 	if _, ok := d.full[name]; ok {
 		return true, nil
 	}
-	for _, suffix := range d.suffix {
-		if name == suffix {
-			return true, nil
-		}
-		if strings.HasSuffix(name, "."+suffix) {
-			return true, nil
-		}
+	if d.suffix.match(name) {
+		return true, nil
 	}
 	for _, kw := range d.kw {
 		if strings.Contains(name, kw) {
@@ -69,10 +64,10 @@ func (d *domainMatcher) init(drs []string) error {
 		if data == "" {
 			return fmt.Errorf("empty domain value")
 		}
-		normalized := matcher.NormalizeDomain(data)
+		normalized := strings.ToLower(matcher.NormalizeDomain(data))
 		switch kind {
 		case "suffix":
-			d.suffix = append(d.suffix, normalized)
+			d.suffix.add(normalized)
 		case "keyword":
 			d.kw = append(d.kw, strings.ToLower(data))
 		case "full":
@@ -92,8 +87,9 @@ func (d *domainMatcher) init(drs []string) error {
 
 func newDomainMatcher(name string, drs []string) (matcher.IDNSMatcher, error) {
 	d := &domainMatcher{
-		name: name,
-		full: map[string]struct{}{},
+		name:   name,
+		full:   map[string]struct{}{},
+		suffix: newSuffixNode(),
 	}
 	if err := d.init(drs); err != nil {
 		return nil, err
