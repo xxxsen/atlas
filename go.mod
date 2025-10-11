@@ -10,6 +10,7 @@ require (
 	github.com/xxxsen/common v0.1.26
 	go.uber.org/zap v1.24.0
 	golang.org/x/sync v0.12.0
+	gopkg.in/yaml.v3 v3.0.1
 )
 
 require github.com/mitchellh/mapstructure v1.5.0 // indirect
