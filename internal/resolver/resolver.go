@@ -1,13 +1,13 @@
 package resolver
 
 import (
-	"atlas/internal/resolver/model"
 	"context"
 	"fmt"
 	"net/url"
 
 	"github.com/gorilla/schema"
 	"github.com/miekg/dns"
+	"github.com/xxxsen/atlas/internal/resolver/model"
 )
 
 type Factory func(schema string, host string, params *model.Params) (IDNSResolver, error)

@@ -1,11 +1,11 @@
 package rule
 
 import (
-	"atlas/internal/action"
-	"atlas/internal/matcher"
 	"context"
 
 	"github.com/miekg/dns"
+	"github.com/xxxsen/atlas/internal/action"
+	"github.com/xxxsen/atlas/internal/matcher"
 )
 
 type IDNSRule interface {

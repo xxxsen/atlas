@@ -1,13 +1,13 @@
 package host
 
 import (
-	"atlas/internal/action"
 	"context"
 	"fmt"
 	"net"
 	"strings"
 
 	"github.com/miekg/dns"
+	"github.com/xxxsen/atlas/internal/action"
 	"github.com/xxxsen/common/utils"
 )
 

@@ -1,7 +1,6 @@
 package resolver
 
 import (
-	"atlas/internal/resolver/model"
 	"bytes"
 	"context"
 	"crypto/tls"
@@ -13,6 +12,7 @@ import (
 	"time"
 
 	"github.com/miekg/dns"
+	"github.com/xxxsen/atlas/internal/resolver/model"
 )
 
 func init() {

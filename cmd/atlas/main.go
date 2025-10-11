@@ -10,14 +10,13 @@ import (
 	"os/signal"
 	"syscall"
 
-	"atlas/internal/action"
-	_ "atlas/internal/action/register"
-	"atlas/internal/config"
-	"atlas/internal/matcher"
-	_ "atlas/internal/matcher/register"
-	"atlas/internal/rule"
-	"atlas/internal/server"
-
+	"github.com/xxxsen/atlas/internal/action"
+	_ "github.com/xxxsen/atlas/internal/action/register"
+	"github.com/xxxsen/atlas/internal/config"
+	"github.com/xxxsen/atlas/internal/matcher"
+	_ "github.com/xxxsen/atlas/internal/matcher/register"
+	"github.com/xxxsen/atlas/internal/rule"
+	"github.com/xxxsen/atlas/internal/server"
 	"github.com/xxxsen/common/logger"
 	"go.uber.org/zap"
 )

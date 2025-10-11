@@ -1,11 +1,11 @@
 package forward
 
 import (
-	"atlas/internal/action"
-	"atlas/internal/resolver"
 	"context"
 
 	"github.com/miekg/dns"
+	"github.com/xxxsen/atlas/internal/action"
+	"github.com/xxxsen/atlas/internal/resolver"
 	"github.com/xxxsen/common/utils"
 )
 

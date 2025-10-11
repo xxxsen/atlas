@@ -1,7 +1,7 @@
 package server
 
 import (
-	"atlas/internal/rule"
+	"github.com/xxxsen/atlas/internal/rule"
 )
 
 // Option configures the DNS server.

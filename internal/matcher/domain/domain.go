@@ -1,13 +1,13 @@
 package matcher
 
 import (
-	"atlas/internal/matcher"
 	"context"
 	"fmt"
 	"regexp"
 	"strings"
 
 	"github.com/miekg/dns"
+	"github.com/xxxsen/atlas/internal/matcher"
 	"github.com/xxxsen/common/utils"
 )
 

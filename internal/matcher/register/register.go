@@ -1,6 +1,6 @@
 package register
 
 import (
-	_ "atlas/internal/matcher/domain"
-	_ "atlas/internal/matcher/qtype"
+	_ "github.com/xxxsen/atlas/internal/matcher/domain"
+	_ "github.com/xxxsen/atlas/internal/matcher/qtype"
 )

@@ -1,4 +1,4 @@
-module atlas
+module github.com/xxxsen/atlas
 
 go 1.24.0
 
