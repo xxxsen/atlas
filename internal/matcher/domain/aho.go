@@ -21,7 +21,7 @@ func newAhoNode() *ahoNode {
 }
 
 func (a *ahoMatcher) add(pattern string) {
-	if a == nil || pattern == "" {
+	if pattern == "" {
 		return
 	}
 	node := a.root
@@ -42,7 +42,7 @@ func (a *ahoMatcher) add(pattern string) {
 }
 
 func (a *ahoMatcher) build() {
-	if a == nil || a.constructed || a.patterns == 0 {
+	if a.constructed || a.patterns == 0 {
 		a.constructed = true
 		return
 	}
@@ -74,7 +74,7 @@ func (a *ahoMatcher) build() {
 }
 
 func (a *ahoMatcher) match(text string) bool {
-	if a == nil || a.patterns == 0 {
+	if a.patterns == 0 {
 		return false
 	}
 	if !a.constructed {
