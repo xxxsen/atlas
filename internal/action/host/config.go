@@ -1,10 +1,5 @@
 package host
 
-type Record struct {
-	Domain string
-	IP     string
-}
-
 type config struct {
-	Records []Record `json:"records"`
+	Records map[string]string `json:"records"` // domain -> comma separated IP list
 }
