@@ -17,7 +17,7 @@ type domainMatcher struct {
 	name   string
 	full   map[string]struct{}
 	suffix *suffixNode
-	kw     []string
+	kw     *ahoMatcher
 	reg    []*regexp.Regexp
 }
 
@@ -37,10 +37,8 @@ func (d *domainMatcher) Match(ctx context.Context, req *dns.Msg) (bool, error) {
 	if d.suffix.match(name) {
 		return true, nil
 	}
-	for _, kw := range d.kw {
-		if strings.Contains(name, kw) {
-			return true, nil
-		}
+	if d.kw.match(name) {
+		return true, nil
 	}
 	for _, reg := range d.reg {
 		if reg.MatchString(name) {
@@ -69,7 +67,7 @@ func (d *domainMatcher) init(drs []string) error {
 		case "suffix":
 			d.suffix.add(normalized)
 		case "keyword":
-			d.kw = append(d.kw, strings.ToLower(data))
+			d.kw.add(strings.ToLower(data))
 		case "full":
 			d.full[normalized] = struct{}{}
 		case "regexp":
@@ -90,10 +88,12 @@ func newDomainMatcher(name string, drs []string) (matcher.IDNSMatcher, error) {
 		name:   name,
 		full:   map[string]struct{}{},
 		suffix: newSuffixNode(),
+		kw:     newAhoMatcher(),
 	}
 	if err := d.init(drs); err != nil {
 		return nil, err
 	}
+	d.kw.build()
 	return d, nil
 }
 
