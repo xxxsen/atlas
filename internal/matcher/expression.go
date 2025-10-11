@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"strings"
-	"unicode"
 
 	"github.com/miekg/dns"
 )
@@ -47,68 +46,35 @@ type token struct {
 }
 
 func tokenizeExpression(expr string) ([]token, error) {
-	var tokens []token
-	reader := strings.NewReader(expr)
-	for reader.Len() > 0 {
-		r, _, err := reader.ReadRune()
-		if err != nil {
-			return nil, err
-		}
-		switch {
-		case unicode.IsSpace(r):
-			continue
-		case r == '(':
-			tokens = append(tokens, token{typ: tokenLParen})
-		case r == ')':
-			tokens = append(tokens, token{typ: tokenRParen})
-		case r == '!':
-			tokens = append(tokens, token{typ: tokenNot})
-		case r == '&':
-			next, _, err := reader.ReadRune()
-			if err != nil || next != '&' {
-				return nil, fmt.Errorf("unexpected '&' in expression")
-			}
+	if expr == "" {
+		return nil, nil
+	}
+	normalised := strings.NewReplacer(
+		"&&", " && ",
+		"||", " || ",
+		"(", " ( ",
+		")", " ) ",
+		"!", " ! ",
+	).Replace(expr)
+	fields := strings.Fields(normalised)
+	tokens := make([]token, 0, len(fields))
+	for _, part := range fields {
+		switch strings.ToLower(part) {
+		case "&&", "and":
 			tokens = append(tokens, token{typ: tokenAnd})
-		case r == '|':
-			next, _, err := reader.ReadRune()
-			if err != nil || next != '|' {
-				return nil, fmt.Errorf("unexpected '|' in expression")
-			}
+		case "||", "or":
 			tokens = append(tokens, token{typ: tokenOr})
+		case "!", "not":
+			tokens = append(tokens, token{typ: tokenNot})
+		case "(":
+			tokens = append(tokens, token{typ: tokenLParen})
+		case ")":
+			tokens = append(tokens, token{typ: tokenRParen})
 		default:
-			builder := strings.Builder{}
-			builder.WriteRune(r)
-			for reader.Len() > 0 {
-				peek, _, err := reader.ReadRune()
-				if err != nil {
-					return nil, err
-				}
-				if !isIdentifierRune(peek) {
-					if err := reader.UnreadRune(); err != nil {
-						return nil, err
-					}
-					break
-				}
-				builder.WriteRune(peek)
-			}
-			word := builder.String()
-			switch strings.ToLower(word) {
-			case "and":
-				tokens = append(tokens, token{typ: tokenAnd})
-			case "or":
-				tokens = append(tokens, token{typ: tokenOr})
-			case "not":
-				tokens = append(tokens, token{typ: tokenNot})
-			default:
-				tokens = append(tokens, token{typ: tokenIdentifier, value: word})
-			}
+			tokens = append(tokens, token{typ: tokenIdentifier, value: part})
 		}
 	}
 	return tokens, nil
-}
-
-func isIdentifierRune(r rune) bool {
-	return r == '-' || r == '_' || unicode.IsDigit(r) || unicode.IsLetter(r)
 }
 
 type exprNode interface {
