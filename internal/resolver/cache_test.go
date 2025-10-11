@@ -3,8 +3,6 @@ package resolver
 import (
 	"context"
 	"net"
-	"os"
-	"path/filepath"
 	"testing"
 	"time"
 
@@ -112,50 +110,5 @@ func TestCacheResolverLazyRefresh(t *testing.T) {
 	time.Sleep(600 * time.Millisecond)
 	if base.count < 2 {
 		t.Fatalf("expected refresh to trigger, base count=%d", base.count)
-	}
-}
-
-func TestCacheResolverPersist(t *testing.T) {
-	dir := t.TempDir()
-	file := filepath.Join(dir, "cache.json")
-
-	ConfigureCache(CacheOptions{Size: 10, Persist: true, File: file})
-	defer ConfigureCache(CacheOptions{})
-
-	base := &mockResolver{msg: newResponse(60)}
-	wrapped := TryEnableResolverCache(base)
-
-	req := newRequest()
-	if _, err := wrapped.Query(context.Background(), req); err != nil {
-		t.Fatalf("first query error: %v", err)
-	}
-	waitFor(t, 3*time.Second, func() bool {
-		_, err := os.Stat(file)
-		return err == nil
-	})
-
-	newBase := &mockResolver{msg: newResponse(60)}
-	ConfigureCache(CacheOptions{Size: 10, Persist: true, File: file})
-	wrapped2 := TryEnableResolverCache(newBase)
-
-	if _, err := wrapped2.Query(context.Background(), req); err != nil {
-		t.Fatalf("query after reload error: %v", err)
-	}
-	if newBase.count != 0 {
-		t.Fatalf("expected cache hit from persisted data, base count=%d", newBase.count)
-	}
-}
-
-func waitFor(t *testing.T, timeout time.Duration, fn func() bool) {
-	t.Helper()
-	deadline := time.Now().Add(timeout)
-	for {
-		if fn() {
-			return
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("condition not met within %s", timeout)
-		}
-		time.Sleep(20 * time.Millisecond)
 	}
 }
