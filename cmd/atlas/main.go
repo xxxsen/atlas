@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"github.com/xxxsen/atlas/internal/action"
@@ -96,23 +97,34 @@ func buildMatcherMap(ms []config.MatcherConfig) (map[string]matcher.IDNSMatcher,
 		}
 		rs[m.Name] = inst
 	}
+	if _, ok := rs["any"]; !ok {
+		anyMatcher, err := matcher.MakeMatcher("any", "any", nil)
+		if err != nil {
+			return nil, fmt.Errorf("create default any matcher: %w", err)
+		}
+		rs["any"] = anyMatcher
+	}
 	return rs, nil
 }
 
 func buildRuleEngine(rules []config.Rule, mat map[string]matcher.IDNSMatcher, atm map[string]action.IDNSAction) (rule.IDNSRuleEngine, error) {
 	rs := make([]rule.IDNSRule, 0, len(rules))
 	for idx, r := range rules {
-		m, err := matcher.BuildExpressionMatcher(r.Match, mat)
+		remark := r.Remark
+		if len(remark) == 0 {
+			remark = fmt.Sprintf("rule:%d", idx)
+		}
+		expr := strings.TrimSpace(r.Match)
+		if expr == "" {
+			expr = "any"
+		}
+		m, err := matcher.BuildExpressionMatcher(expr, mat)
 		if err != nil {
-			return nil, fmt.Errorf("compile matcher expression failed, expr:%s, err:%w", r.Match, err)
+			return nil, fmt.Errorf("compile matcher expression failed, expr:%s, err:%w", expr, err)
 		}
 		a, ok := atm[r.Action]
 		if !ok {
 			return nil, fmt.Errorf("action not found, name:%s", r.Action)
-		}
-		remark := r.Remark
-		if len(remark) == 0 {
-			remark = fmt.Sprintf("rule:%d", idx)
 		}
 		inst := rule.NewRule(remark, m, a)
 		rs = append(rs, inst)
