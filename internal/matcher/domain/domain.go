@@ -35,7 +35,10 @@ func (d *domainMatcher) Match(ctx context.Context, req *dns.Msg) (bool, error) {
 		return true, nil
 	}
 	for _, suffix := range d.suffix {
-		if strings.HasSuffix(name, suffix) {
+		if name == suffix {
+			return true, nil
+		}
+		if strings.HasSuffix(name, "."+suffix) {
 			return true, nil
 		}
 	}
@@ -62,14 +65,18 @@ func (d *domainMatcher) init(drs []string) error {
 			return fmt.Errorf("invalid domain config")
 		}
 		kind := items[0]
-		data := items[1]
+		data := strings.TrimSpace(items[1])
+		if data == "" {
+			return fmt.Errorf("empty domain value")
+		}
+		normalized := matcher.NormalizeDomain(data)
 		switch kind {
 		case "suffix":
-			d.suffix = append(d.suffix, data)
+			d.suffix = append(d.suffix, normalized)
 		case "keyword":
-			d.kw = append(d.kw, data)
+			d.kw = append(d.kw, strings.ToLower(data))
 		case "full":
-			d.full[data] = struct{}{}
+			d.full[normalized] = struct{}{}
 		case "regexp":
 			exp, err := regexp.Compile(data)
 			if err != nil {
