@@ -86,19 +86,34 @@ func createGeositeMatcher(name string, args interface{}) (mainmatcher.IDNSMatche
 		return nil, fmt.Errorf("geosite matcher requires categories")
 	}
 
-	data, err := geositeprovider.GeositeProvider.Load(cfg.File)
+	specs := make([]listSpec, 0, len(cfg.Categories))
+	uniqueNames := make(map[string]struct{})
+	for _, rawSpec := range cfg.Categories {
+		spec := parseListSpec(rawSpec)
+		if spec.name == "" {
+			continue
+		}
+		specs = append(specs, spec)
+		uniqueNames[spec.name] = struct{}{}
+	}
+	if len(specs) == 0 {
+		return nil, fmt.Errorf("geosite matcher requires valid categories")
+	}
+
+	names := make([]string, 0, len(uniqueNames))
+	for name := range uniqueNames {
+		names = append(names, name)
+	}
+
+	categories, err := geositeprovider.GeositeProvider.LoadCategories(cfg.File, names)
 	if err != nil {
 		return nil, err
 	}
 
 	var domainRules []string
 	seen := make(map[string]struct{})
-	for _, rawSpec := range cfg.Categories {
-		spec := parseListSpec(rawSpec)
-		if spec.name == "" {
-			continue
-		}
-		domains, ok := data.Domains(spec.name)
+	for _, spec := range specs {
+		domains, ok := categories[spec.name]
 		if !ok {
 			return nil, fmt.Errorf("geosite category %s not found", spec.name)
 		}

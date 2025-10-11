@@ -5,9 +5,11 @@ import (
 	"strings"
 )
 
-func parseGeoSiteList(data []byte) (map[string][]Domain, error) {
+func parseGeoSiteList(data []byte, filter map[string]struct{}) (map[string][]Domain, error) {
 	result := make(map[string][]Domain)
 	offset := 0
+	found := 0
+	expected := len(filter)
 	for offset < len(data) {
 		fieldNum, wireType, err := readTag(data, &offset)
 		if err != nil {
@@ -18,14 +20,23 @@ func parseGeoSiteList(data []byte) (map[string][]Domain, error) {
 			if err != nil {
 				return nil, err
 			}
-			entry, err := parseGeoSite(msg)
+			name, domains, include, err := parseGeoSiteFiltered(msg, filter)
 			if err != nil {
 				return nil, err
 			}
-			if entry.name == "" {
+			if !include || name == "" {
+				if filter != nil && expected > 0 && found >= expected {
+					break
+				}
 				continue
 			}
-			result[entry.name] = append(result[entry.name], entry.domains...)
+			if _, ok := result[name]; !ok {
+				found++
+			}
+			result[name] = append(result[name], domains...)
+			if filter != nil && expected > 0 && found >= expected {
+				break
+			}
 			continue
 		}
 		if err := skipField(data, &offset, wireType); err != nil {
@@ -35,49 +46,57 @@ func parseGeoSiteList(data []byte) (map[string][]Domain, error) {
 	return result, nil
 }
 
-type geoSite struct {
-	name    string
-	domains []Domain
-}
-
-func parseGeoSite(data []byte) (*geoSite, error) {
+func parseGeoSiteFiltered(data []byte, filter map[string]struct{}) (string, []Domain, bool, error) {
 	offset := 0
-	entry := &geoSite{}
+	name := ""
+	include := filter == nil
+	domains := make([]Domain, 0)
 	for offset < len(data) {
 		fieldNum, wireType, err := readTag(data, &offset)
 		if err != nil {
-			return nil, err
+			return "", nil, false, err
 		}
 		switch fieldNum {
 		case 1:
 			if wireType != wireTypeLengthDelimited {
-				return nil, fmt.Errorf("unexpected wire type %d for GeoSite.country_code", wireType)
+				return "", nil, false, fmt.Errorf("unexpected wire type %d for GeoSite.country_code", wireType)
 			}
 			str, err := readString(data, &offset)
 			if err != nil {
-				return nil, err
+				return "", nil, false, err
 			}
-			entry.name = strings.ToLower(strings.TrimSpace(str))
+			name = strings.ToLower(strings.TrimSpace(str))
+			if !include && filter != nil {
+				if _, ok := filter[name]; ok {
+					include = true
+				}
+			}
 		case 2:
 			if wireType != wireTypeLengthDelimited {
-				return nil, fmt.Errorf("unexpected wire type %d for GeoSite.domain", wireType)
+				return "", nil, false, fmt.Errorf("unexpected wire type %d for GeoSite.domain", wireType)
 			}
 			msg, err := readBytes(data, &offset)
 			if err != nil {
-				return nil, err
+				return "", nil, false, err
+			}
+			if !include {
+				continue
 			}
 			domain, err := parseGeoDomain(msg)
 			if err != nil {
-				return nil, err
+				return "", nil, false, err
 			}
-			entry.domains = append(entry.domains, domain)
+			domains = append(domains, domain)
 		default:
 			if err := skipField(data, &offset, wireType); err != nil {
-				return nil, err
+				return "", nil, false, err
 			}
 		}
 	}
-	return entry, nil
+	if name == "" || !include {
+		return name, nil, false, nil
+	}
+	return name, domains, true, nil
 }
 
 func parseGeoDomain(data []byte) (Domain, error) {
