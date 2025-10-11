@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strconv"
 	"sync/atomic"
+	"time"
 
 	"github.com/miekg/dns"
 	"github.com/xxxsen/common/logutil"
@@ -85,28 +86,33 @@ func (s *dnsServer) handleDNS(ctx context.Context, w dns.ResponseWriter, req *dn
 	tid := atomic.AddUint64(&s.tid, 1)
 	ctx = trace.WithTraceId(ctx, strconv.FormatUint(tid, 10))
 	logger := logutil.GetLogger(ctx)
+	if req.Opcode != dns.OpcodeQuery || len(req.Question) == 0 {
+		logger.Error("recv invalid dns request, skip next")
+		return
+	}
+	logger = logger.With(zap.String("domain", req.Question[0].Name), zap.Uint16("qtype", req.Question[0].Qtype))
+	logger.Debug("recv request, handle it")
+	start := time.Now()
 	resp, err := s.processRequest(ctx, req)
+	cost := time.Since(start)
+	logger = logger.With(zap.Duration("proc_cost", cost))
 	if err != nil {
-		logger.Error("process dns request failed", zap.Error(err))
+		logger.Error("process request failed", zap.Error(err))
 		resp = new(dns.Msg)
 		resp.SetRcode(req, dns.RcodeServerFailure)
+	}
+	start = time.Now()
+	err = w.WriteMsg(resp)
+	writeCost := time.Since(start)
+	logger = logger.With(zap.Duration("write_cost", writeCost))
+	if err != nil {
+		logger.Error("write response to client failed", zap.Error(err))
 		return
 	}
-	if err := w.WriteMsg(resp); err != nil {
-		logger.Error("write response failed", zap.Error(err))
-		return
-	}
-	logger.Debug("response sent to client succ")
+	logger.Info("handle dns request succ")
 }
 
 func (s *dnsServer) processRequest(ctx context.Context, req *dns.Msg) (*dns.Msg, error) {
-	if req.Opcode != dns.OpcodeQuery || len(req.Question) == 0 {
-		return nil, fmt.Errorf("invalid dns request, may be not implment yet")
-	}
-	question := req.Question[0]
-	logger := logutil.GetLogger(ctx)
-	logger.Debug("recv dns request", zap.String("domain", question.Name), zap.Uint16("qtype", question.Qtype))
-
 	rsp, err := s.c.re.Execute(ctx, req)
 	if err != nil {
 		return nil, err
