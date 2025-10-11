@@ -95,9 +95,9 @@ func buildMatcherMap(ms []config.MatcherConfig) (map[string]matcher.IDNSMatcher,
 func buildRuleEngine(rules []config.Rule, mat map[string]matcher.IDNSMatcher, atm map[string]action.IDNSAction) (rule.IDNSRuleEngine, error) {
 	rs := make([]rule.IDNSRule, 0, len(rules))
 	for idx, r := range rules {
-		m, ok := mat[r.Match]
-		if !ok {
-			return nil, fmt.Errorf("matcher not found, name:%s", r.Match)
+		m, err := matcher.BuildExpressionMatcher(r.Match, mat)
+		if err != nil {
+			return nil, fmt.Errorf("compile matcher expression failed, expr:%s, err:%w", r.Match, err)
 		}
 		a, ok := atm[r.Action]
 		if !ok {
