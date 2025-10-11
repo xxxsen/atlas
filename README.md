@@ -8,7 +8,7 @@ Atlas 是一个可编程的 DNS 转发器，核心由“匹配器（matcher）+ 
   - 经典 UDP/TCP、DNS over TLS (`dot://`)、DNS over HTTPS (`https://`)。
   - 组解析器支持并发查询，自动选取可用结果。
 - **规则驱动的分流**
-  - 支持 `domain`、`geosite`、`qtype`、`any` 等多种匹配器。
+  - 支持 `domain`、`geosite`、`qtype`、`qclass`、`any` 等多种匹配器。
   - 逻辑表达式组合（`and`/`or`/`not`，或 `&&`/`||`/`!`）更灵活。
 - **丰富的动作**
   - `forward`：转发到一个或多个下游解析器。
@@ -109,6 +109,7 @@ log:
 | `domain` | `full`、`suffix`、`keyword`、`regexp` 等规则；支持内联 `domains` 或外部 `files` | `domains`, `files` |
 | `geosite` | 读取 `geosite.dat` 分类，可通过 `@attr` / `@!attr` 过滤属性 | `file`, `categories` |
 | `qtype` | 匹配指定 DNS 类型（A=1, AAAA=28 等） | `types` |
+| `qclass` | 匹配 DNS 类别（IN=1、CH=3 等） | `classes` |
 | `any` | 恒为 true，适合作为兜底 | *(无)* |
 
 匹配表达式由 `BuildExpressionMatcher` 解析，可组合布尔逻辑。
@@ -130,4 +131,3 @@ log:
 - `https://`：DNS over HTTPS。
 - group 解析器支持并发 fan-out，返回首个成功结果。
 - `TryEnableResolverCache` 可为任意解析器加缓存层。
-
