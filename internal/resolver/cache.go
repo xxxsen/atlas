@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -74,7 +73,7 @@ type cacheEntry struct {
 func newCacheResolver(next IDNSResolver, cfg CacheOptions) *cacheResolver {
 	lruCache, err := lru.New[string, *cacheEntry](int(cfg.Size))
 	if err != nil {
-		log.Printf("cache resolver: init lru failed: %v", err)
+		logutil.GetLogger(context.Background()).Error("init lru failed", zap.Error(err))
 		return &cacheResolver{next: next, cfg: CacheOptions{}}
 	}
 	c := &cacheResolver{

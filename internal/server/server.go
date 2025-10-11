@@ -96,10 +96,12 @@ func (s *dnsServer) handleDNS(ctx context.Context, w dns.ResponseWriter, req *dn
 	resp, err := s.processRequest(ctx, req)
 	cost := time.Since(start)
 	logger = logger.With(zap.Duration("proc_cost", cost))
+	succ := true
 	if err != nil {
 		logger.Error("process request failed", zap.Error(err))
 		resp = new(dns.Msg)
 		resp.SetRcode(req, dns.RcodeServerFailure)
+		succ = false
 	}
 	start = time.Now()
 	err = w.WriteMsg(resp)
@@ -109,7 +111,7 @@ func (s *dnsServer) handleDNS(ctx context.Context, w dns.ResponseWriter, req *dn
 		logger.Error("write response to client failed", zap.Error(err))
 		return
 	}
-	logger.Info("handle dns request succ")
+	logger.Info("handle dns request finish", zap.Bool("succ", succ))
 }
 
 func (s *dnsServer) processRequest(ctx context.Context, req *dns.Msg) (*dns.Msg, error) {
