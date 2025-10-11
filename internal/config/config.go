@@ -15,6 +15,14 @@ type Config struct {
 	Resource Resource         `json:"resource"`
 	Rules    []Rule           `json:"rules"`
 	Log      logger.LogConfig `json:"log"`
+	Cache    CacheConfig      `json:"cache"`
+}
+
+type CacheConfig struct {
+	Size    int64  `json:"size"`
+	Lazy    bool   `json:"lazy"`
+	Persist bool   `json:"persist"`
+	File    string `json:"file"`
 }
 
 type MatcherConfig struct {
