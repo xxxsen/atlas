@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"math/rand/v2"
-	"strings"
 	"sync/atomic"
 
 	"github.com/miekg/dns"
@@ -66,13 +65,9 @@ func (p *groupResolver) Query(ctx context.Context, req *dns.Msg) (*dns.Msg, erro
 }
 
 func NewGroupResolver(res []IDNSResolver, concurrent int) IDNSResolver {
-	return &groupResolver{name: buildGroupName(res), res: res, concurrent: concurrent}
+	return &groupResolver{name: buildGroupName(res, concurrent), res: res, concurrent: concurrent}
 }
 
-func buildGroupName(res []IDNSResolver) string {
-	rs := make([]string, 0, len(res))
-	for _, item := range res {
-		rs = append(rs, item.Name())
-	}
-	return "group:{" + strings.Join(rs, ",") + "}"
+func buildGroupName(res []IDNSResolver, cc int) string {
+	return fmt.Sprintf("group:{%d:%d}", len(res), cc)
 }

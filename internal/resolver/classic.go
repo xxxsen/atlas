@@ -74,7 +74,6 @@ func (r *classicResolver) exchangeContext(ctx context.Context, client *dns.Clien
 	logger.Debug("classic resolver start query")
 	resp, _, err := client.ExchangeContext(ctx, req, addr)
 	if err != nil {
-		logger.Error("classic resolver query failed", zap.Error(err))
 		return nil, err
 	}
 	if resp == nil {

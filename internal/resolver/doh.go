@@ -78,7 +78,6 @@ func (r *dohResolver) Query(ctx context.Context, req *dns.Msg) (*dns.Msg, error)
 
 	resp, err := r.client.Do(httpReq)
 	if err != nil {
-		logger.Error("doh resolver request failed", zap.Error(err))
 		return nil, fmt.Errorf("doh request: %w", err)
 	}
 	defer resp.Body.Close()

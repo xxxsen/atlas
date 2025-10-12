@@ -43,11 +43,13 @@ cache:
   size: 50000
   lazy: true
   persist: true
-  file: "./.vscode/dns.cache"
+  file: "/data/dns.cache"
 resource:
   hosts:
     records:
       www.example.com: "1.1.1.1,2.2.2.2,3.3.3.3"
+    files:
+      - /data/hosts.txt  
   matcher:
     - name: remote
       type: domain
@@ -57,7 +59,7 @@ resource:
     - name: local
       type: geosite
       data:
-        file: "./.vscode/geosite.dat"
+        file: "/data/geosite.dat"
         categories: [cn]
   action:
     - name: forward-local
