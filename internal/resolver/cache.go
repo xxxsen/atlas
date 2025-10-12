@@ -26,7 +26,7 @@ type CacheOptions struct {
 	File    string
 }
 
-const persistInterval = 1 * time.Minute
+const persistInterval = 10 * time.Minute
 
 var globalCacheOptions atomic.Value
 
