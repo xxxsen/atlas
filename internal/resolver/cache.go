@@ -15,6 +15,7 @@ import (
 	lru "github.com/hashicorp/golang-lru/v2"
 	"github.com/miekg/dns"
 	"github.com/xxxsen/common/logutil"
+	"github.com/xxxsen/common/trace"
 	"go.uber.org/zap"
 )
 
@@ -67,7 +68,7 @@ type cacheResolver struct {
 
 type cacheEntry struct {
 	key    string
-	msg    *dns.Msg
+	data   []byte
 	expire time.Time
 }
 
@@ -98,7 +99,7 @@ func (c *cacheResolver) Name() string {
 
 func (c *cacheResolver) Query(ctx context.Context, req *dns.Msg) (*dns.Msg, error) {
 	key := c.buildCacheKey(req)
-	msg, expired, found := c.get(key)
+	msg, expired, found := c.get(ctx, key)
 	if found {
 		msg.Id = req.Id
 		msg.Question = append([]dns.Question(nil), req.Question...)
@@ -108,7 +109,7 @@ func (c *cacheResolver) Query(ctx context.Context, req *dns.Msg) (*dns.Msg, erro
 		}
 		if c.cfg.Lazy {
 			logutil.GetLogger(ctx).Debug("use expire dns response from cache, start refresh it")
-			c.scheduleRefresh(key, req.Copy())
+			c.scheduleRefresh(ctx, key, req.Copy())
 			return msg, nil
 		}
 		c.remove(key)
@@ -122,30 +123,34 @@ func (c *cacheResolver) Query(ctx context.Context, req *dns.Msg) (*dns.Msg, erro
 	return resp, nil
 }
 
-func (c *cacheResolver) get(key string) (*dns.Msg, bool, bool) {
+func (c *cacheResolver) get(ctx context.Context, key string) (*dns.Msg, bool, bool) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	entry, ok := c.cache.Get(key)
 	if !ok {
+		c.mu.Unlock()
 		return nil, false, false
 	}
-	copy := entry.msg.Copy()
-	remaining := time.Until(entry.expire)
+	data := entry.data
+	expire := entry.expire
+	c.mu.Unlock()
+	msg := new(dns.Msg)
+	if err := msg.Unpack(data); err != nil {
+		logutil.GetLogger(ctx).Error("invalid cache data, skip it", zap.String("key", key))
+		return nil, false, false
+	}
+	remaining := time.Until(expire)
 	var ttlSeconds uint32
 	if remaining > 0 {
 		ttlSeconds = uint32(remaining / time.Second)
 	}
-	c.adjustTTL(copy, ttlSeconds)
-	expired := time.Now().After(entry.expire)
-	return copy, expired, true
+	c.adjustTTL(msg, ttlSeconds)
+	expired := time.Now().After(expire)
+	return msg, expired, true
 }
 
 func (c *cacheResolver) remove(key string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.cache == nil {
-		return
-	}
 	c.cache.Remove(key)
 	c.dirty = true
 }
@@ -155,7 +160,10 @@ func (c *cacheResolver) store(key string, msg *dns.Msg) {
 	if !ok || ttl == 0 {
 		return
 	}
-	copy := msg.Copy()
+	packed, err := msg.Pack()
+	if err != nil {
+		return
+	}
 	expire := time.Now().Add(time.Duration(ttl) * time.Second)
 
 	c.mu.Lock()
@@ -163,13 +171,13 @@ func (c *cacheResolver) store(key string, msg *dns.Msg) {
 
 	c.cache.Add(key, &cacheEntry{
 		key:    key,
-		msg:    copy,
+		data:   packed,
 		expire: expire,
 	})
 	c.dirty = true
 }
 
-func (c *cacheResolver) scheduleRefresh(key string, req *dns.Msg) {
+func (c *cacheResolver) scheduleRefresh(oldctx context.Context, key string, req *dns.Msg) {
 	c.mu.Lock()
 	if _, ok := c.inflight[key]; ok {
 		c.mu.Unlock()
@@ -177,14 +185,15 @@ func (c *cacheResolver) scheduleRefresh(key string, req *dns.Msg) {
 	}
 	c.inflight[key] = struct{}{}
 	c.mu.Unlock()
-
+	tid, _ := trace.GetTraceId(oldctx)
+	ctx := trace.WithTraceId(context.Background(), tid)
 	go func() {
 		defer func() {
 			c.mu.Lock()
 			delete(c.inflight, key)
 			c.mu.Unlock()
 		}()
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		defer cancel()
 		resp, err := c.next.Query(ctx, req)
 		if err != nil {
@@ -241,7 +250,7 @@ func (c *cacheResolver) persist(ctx context.Context) {
 		_ = os.Remove(tmpPath)
 		return
 	}
-	logutil.GetLogger(ctx).Debug("save persist dns cache file succ", zap.Int("record_count", len(snapshot)))
+	logutil.GetLogger(ctx).Info("save persist dns cache file succ", zap.Int("record_count", len(snapshot)))
 }
 
 func (c *cacheResolver) snapshot() []persistRecord {
@@ -250,15 +259,10 @@ func (c *cacheResolver) snapshot() []persistRecord {
 	values := c.cache.Values()
 	records := make([]persistRecord, 0, len(values))
 	for _, entry := range values {
-		msg := entry.msg.Copy()
-		bs, err := msg.Pack()
-		if err != nil {
-			continue
-		}
 		records = append(records, persistRecord{
 			Key:    entry.key,
 			Expire: entry.expire.UnixMilli(),
-			Msg:    bs,
+			Msg:    entry.data,
 		})
 	}
 	return records
@@ -309,17 +313,13 @@ func (c *cacheResolver) loadFromFile() error {
 		if err := json.Unmarshal([]byte(line), &rec); err != nil {
 			continue
 		}
-		msg := &dns.Msg{}
-		if err := msg.Unpack(rec.Msg); err != nil {
-			continue
-		}
 		expire := time.UnixMilli(rec.Expire)
 		if expire.Before(now) && !c.cfg.Lazy { //已经过期了, 且没有懒加载, 则直接跳过
 			continue
 		}
 		entry := &cacheEntry{
 			key:    rec.Key,
-			msg:    msg,
+			data:   rec.Msg,
 			expire: expire,
 		}
 		c.mu.Lock()
