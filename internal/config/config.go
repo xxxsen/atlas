@@ -16,6 +16,7 @@ type Config struct {
 	Rule     []Rule           `json:"rule" yaml:"rule"`
 	Log      logger.LogConfig `json:"log" yaml:"log"`
 	Cache    CacheConfig      `json:"cache" yaml:"cache"`
+	Pprof    PprofConfig      `json:"pprof" yaml:"pprof"`
 }
 
 type CacheConfig struct {
@@ -35,6 +36,11 @@ type ActionConfig struct {
 	Name string      `json:"name" yaml:"name"`
 	Type string      `json:"type" yaml:"type"`
 	Data interface{} `json:"data" yaml:"data"`
+}
+
+type PprofConfig struct {
+	Enable bool   `json:"enable" yaml:"enable"`
+	Bind   string `json:"bind" yaml:"bind"`
 }
 
 type Rule struct {

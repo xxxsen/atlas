@@ -75,7 +75,11 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	logkit.Info("dns forwarder listening", zap.String("addr", cfg.Bind))
+	if cfg.Pprof.Enable {
+		startPprofServer(ctx, cfg.Pprof.Bind, logkit)
+	}
+
+	logkit.Info("start dns forwarder server", zap.String("addr", cfg.Bind))
 	if err := forwarder.Start(ctx); err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, syscall.EINTR) {
 		logkit.Fatal("server error", zap.Error(err))
 	}

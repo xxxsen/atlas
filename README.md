@@ -39,6 +39,9 @@ go build ./cmd/atlas
 
 ```yaml
 bind: ":5553"
+pprof:
+  enable: false
+  bind: ":6060"
 cache:
   size: 50000
   lazy: true
