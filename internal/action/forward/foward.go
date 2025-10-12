@@ -21,7 +21,7 @@ func (f *forwardAction) Name() string {
 }
 
 func (f *forwardAction) Perform(ctx context.Context, req *dns.Msg) (*dns.Msg, error) {
-	logger := logutil.GetLogger(ctx).With(zap.String("action", f.name), zap.String("target_resolver", f.r.String()))
+	logger := logutil.GetLogger(ctx).With(zap.String("action", f.name), zap.String("target_resolver", f.r.Name()))
 	logger.Debug("forward action start")
 	resp, err := f.r.Query(ctx, req)
 	if err != nil {

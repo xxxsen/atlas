@@ -92,11 +92,8 @@ func newCacheResolver(next IDNSResolver, cfg CacheOptions) *cacheResolver {
 	return c
 }
 
-func (c *cacheResolver) String() string {
-	if c.cache == nil {
-		return c.next.String()
-	}
-	return fmt.Sprintf("cache(%s)", c.next.String())
+func (c *cacheResolver) Name() string {
+	return fmt.Sprintf("cache(%s)", c.next.Name())
 }
 
 func (c *cacheResolver) Query(ctx context.Context, req *dns.Msg) (*dns.Msg, error) {

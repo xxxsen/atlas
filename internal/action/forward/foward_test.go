@@ -15,7 +15,7 @@ type stubResolver struct {
 	err error
 }
 
-func (s *stubResolver) String() string { return "stub-resolver" }
+func (s *stubResolver) Name() string { return "stub-resolver" }
 
 func (s *stubResolver) Query(ctx context.Context, req *dns.Msg) (*dns.Msg, error) {
 	if s.err != nil {

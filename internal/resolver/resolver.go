@@ -59,6 +59,6 @@ func Register(schema string, fac Factory) {
 
 // IDNSResolver represents a downstream resolver.
 type IDNSResolver interface {
-	String() string
+	Name() string
 	Query(ctx context.Context, req *dns.Msg) (*dns.Msg, error)
 }

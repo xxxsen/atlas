@@ -15,7 +15,7 @@ type mockResolver struct {
 	err   error
 }
 
-func (m *mockResolver) String() string {
+func (m *mockResolver) Name() string {
 	return "mock"
 }
 

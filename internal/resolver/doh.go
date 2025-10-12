@@ -57,12 +57,12 @@ type dohResolver struct {
 	client   *http.Client
 }
 
-func (r *dohResolver) String() string {
+func (r *dohResolver) Name() string {
 	return "doh:" + r.endpoint
 }
 
 func (r *dohResolver) Query(ctx context.Context, req *dns.Msg) (*dns.Msg, error) {
-	logger := logutil.GetLogger(ctx).With(zap.String("resolver", r.String()))
+	logger := logutil.GetLogger(ctx).With(zap.String("resolver", r.Name()))
 	logger.Debug("doh resolver start query")
 	payload, err := req.Pack()
 	if err != nil {

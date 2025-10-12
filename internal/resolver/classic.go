@@ -58,7 +58,7 @@ type classicResolver struct {
 	client *dns.Client
 }
 
-func (r *classicResolver) String() string {
+func (r *classicResolver) Name() string {
 	return fmt.Sprintf("%s/%s", r.client.Net, r.addr)
 }
 
@@ -68,7 +68,7 @@ func (r *classicResolver) Query(ctx context.Context, req *dns.Msg) (*dns.Msg, er
 
 func (r *classicResolver) exchangeContext(ctx context.Context, client *dns.Client, req *dns.Msg, addr string) (*dns.Msg, error) {
 	logger := logutil.GetLogger(ctx).With(
-		zap.String("resolver", r.String()),
+		zap.String("resolver", r.Name()),
 		zap.String("server_addr", addr),
 	)
 	logger.Debug("classic resolver start query")

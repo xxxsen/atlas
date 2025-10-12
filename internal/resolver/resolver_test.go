@@ -13,7 +13,7 @@ type stubDNSResolver struct {
 	err error
 }
 
-func (s *stubDNSResolver) String() string { return "stub" }
+func (s *stubDNSResolver) Name() string { return "stub" }
 func (s *stubDNSResolver) Query(ctx context.Context, req *dns.Msg) (*dns.Msg, error) {
 	if s.err != nil {
 		return nil, s.err
