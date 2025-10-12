@@ -45,6 +45,9 @@ cache:
   persist: true
   file: "./.vscode/dns.cache"
 resource:
+  hosts:
+    records:
+      www.example.com: "1.1.1.1,2.2.2.2,3.3.3.3"
   matcher:
     - name: remote
       type: domain
@@ -56,10 +59,6 @@ resource:
       data:
         file: "./.vscode/geosite.dat"
         categories: [cn]
-    - name: test-host
-      type: domain
-      data:
-        files: ["./.vscode/domain.txt"]
   action:
     - name: forward-local
       type: forward
@@ -71,13 +70,8 @@ resource:
       type: forward
       data:
         server_list:
-          - "https://dns.google/dns-query"
+          - "https://1.1.1.1/dns-query"
         parallel: 2
-    - name: use-host
-      type: host
-      data:
-        records:
-          www.example.com: "1.1.1.1,2.2.2.2,3.3.3.3"
     - name: block
       type: rcode
       data:
@@ -86,9 +80,6 @@ rules:
   - remark: prefer local
     match: local
     action: forward-local
-  - remark: test host override
-    match: test-host
-    action: use-host
   - remark: remote fallback
     match: remote
     action: forward-remote
@@ -119,8 +110,7 @@ log:
 | 类型 | 行为 | 配置字段 |
 | ---- | ---- | -------- |
 | `forward` | 转发到下游解析器，支持并发查询 | `server_list`, `parallel` |
-| `host` | 返回静态 A/AAAA 记录 | `records` |
-| `rcode` / `noerror` / `servfail` / `refused` | 直接返回对应 RCODE 的应答 | `code`（别名可省略） |
+| `rcode`  | 直接返回对应 RCODE 的应答 | `code` |
 
 新增 Action 或 Matcher 只需在各自包内实现并注册，配置层即可使用。
 

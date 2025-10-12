@@ -14,6 +14,7 @@ import (
 	"github.com/xxxsen/atlas/internal/action"
 	_ "github.com/xxxsen/atlas/internal/action/register"
 	"github.com/xxxsen/atlas/internal/config"
+	"github.com/xxxsen/atlas/internal/hosts"
 	"github.com/xxxsen/atlas/internal/matcher"
 	_ "github.com/xxxsen/atlas/internal/matcher/register"
 	"github.com/xxxsen/atlas/internal/resolver"
@@ -51,6 +52,10 @@ func main() {
 	if err != nil {
 		logkit.Fatal("build action map failed", zap.Error(err))
 	}
+	hosts, err := buildHostStore(cfg.Resource.Host)
+	if err != nil {
+		logkit.Fatal("build host store failed", zap.Error(err))
+	}
 	engine, err := buildRuleEngine(cfg.Rule, ms, as)
 	if err != nil {
 		logkit.Fatal("build rule engine failed", zap.Error(err))
@@ -58,6 +63,7 @@ func main() {
 
 	serverOpts := []server.Option{
 		server.WithBind(cfg.Bind),
+		server.WithHostResolver(hosts),
 		server.WithRuleEngine(engine),
 	}
 
@@ -130,4 +136,15 @@ func buildRuleEngine(rules []config.Rule, mat map[string]matcher.IDNSMatcher, at
 		rs = append(rs, inst)
 	}
 	return rule.NewEngine(rs...), nil
+}
+
+func buildHostStore(cfg config.HostConfig) (hosts.IHostResolver, error) {
+	if len(cfg.Records) == 0 && len(cfg.Files) == 0 {
+		return nil, nil
+	}
+	recs, err := hosts.LoadRecordsFromFiles(cfg.Files)
+	if err != nil {
+		return nil, err
+	}
+	return hosts.New(append(recs, cfg.Records)...)
 }

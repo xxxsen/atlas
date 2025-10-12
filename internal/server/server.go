@@ -135,9 +135,33 @@ func (s *dnsServer) summariseIPs(msg *dns.Msg) string {
 }
 
 func (s *dnsServer) processRequest(ctx context.Context, req *dns.Msg) (*dns.Msg, error) {
+	//先处理host
+	if rsp, ok := s.tryHosts(ctx, req); ok {
+		return rsp, nil
+	}
+	//再处理规则引擎
 	rsp, err := s.c.re.Execute(ctx, req)
 	if err != nil {
 		return nil, err
 	}
 	return rsp, nil
+}
+
+func (s *dnsServer) tryHosts(ctx context.Context, req *dns.Msg) (*dns.Msg, bool) {
+	if s.c.hosts == nil {
+		return nil, false
+	}
+	resp := new(dns.Msg)
+	resp.SetReply(req)
+	resp.Authoritative = true
+	for _, question := range req.Question {
+		if answers, ok := s.c.hosts.Resolve(question); ok {
+			resp.Answer = append(resp.Answer, answers...)
+		}
+	}
+	if len(resp.Answer) == 0 {
+		return nil, false
+	}
+	logutil.GetLogger(ctx).Debug("dns match hosts")
+	return resp, true
 }

@@ -43,7 +43,13 @@ type Rule struct {
 	Action string `json:"action" yaml:"action"`
 }
 
+type HostConfig struct {
+	Records map[string]string `json:"records" yaml:"records"`
+	Files   []string          `json:"files" yaml:"files"`
+}
+
 type Resource struct {
+	Host    HostConfig      `json:"host" yaml:"host"`
 	Matcher []MatcherConfig `json:"matcher" yaml:"matcher"`
 	Action  []ActionConfig  `json:"action" yaml:"action"`
 }

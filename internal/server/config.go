@@ -1,6 +1,7 @@
 package server
 
 import (
+	"github.com/xxxsen/atlas/internal/hosts"
 	"github.com/xxxsen/atlas/internal/rule"
 )
 
@@ -8,8 +9,9 @@ import (
 type Option func(*options)
 
 type options struct {
-	bind string
-	re   rule.IDNSRuleEngine
+	bind  string
+	re    rule.IDNSRuleEngine
+	hosts hosts.IHostResolver
 }
 
 // WithBind configures the bind address.
@@ -23,5 +25,11 @@ func WithBind(bind string) Option {
 func WithRuleEngine(re rule.IDNSRuleEngine) Option {
 	return func(o *options) {
 		o.re = re
+	}
+}
+
+func WithHostResolver(hts hosts.IHostResolver) Option {
+	return func(o *options) {
+		o.hosts = hts
 	}
 }
