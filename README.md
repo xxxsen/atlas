@@ -48,7 +48,7 @@ cache:
   persist: true
   file: "/data/dns.cache"
 resource:
-  hosts:
+  host:
     records:
       www.example.com: "1.1.1.1,2.2.2.2,3.3.3.3"
     files:
