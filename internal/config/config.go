@@ -20,10 +20,11 @@ type Config struct {
 }
 
 type CacheConfig struct {
-	Size    int64  `json:"size" yaml:"size"`
-	Lazy    bool   `json:"lazy" yaml:"lazy"`
-	Persist bool   `json:"persist" yaml:"persist"`
-	File    string `json:"file" yaml:"file"`
+	Size     int64  `json:"size" yaml:"size"`
+	Lazy     bool   `json:"lazy" yaml:"lazy"`
+	Persist  bool   `json:"persist" yaml:"persist"`
+	File     string `json:"file" yaml:"file"`
+	Interval int64  `json:"interval" yaml:"interval"`
 }
 
 type MatcherConfig struct {

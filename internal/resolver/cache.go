@@ -21,15 +21,14 @@ import (
 
 // CacheOptions controls the behaviour of the cache resolver wrapper.
 type CacheOptions struct {
-	Size    int64
-	Lazy    bool
-	Persist bool
-	File    string
+	Size     int64
+	Lazy     bool
+	Persist  bool
+	File     string
+	Interval time.Duration
 }
 
-const persistInterval = 10 * time.Minute
-
-var globalCacheOptions atomic.Value
+var globalCacheManager atomic.Value
 
 func init() {
 	ConfigureCache(CacheOptions{ //默认启用基础缓存, 缓存1w个key, 用户需要的情况下, 再开启lazycache
@@ -40,25 +39,44 @@ func init() {
 // ConfigureCache sets the global cache options that will be used when wrapping resolvers.
 func ConfigureCache(opt CacheOptions) {
 	if opt.Size < 0 {
-		opt.Size = 0
+		opt.Size = 1000
 	}
-	globalCacheOptions.Store(opt)
+	if opt.Interval == 0 {
+		opt.Interval = 10 * time.Minute
+	}
+	old, ok := globalCacheManager.Load().(*cacheManager)
+	if ok {
+		old.Close()
+	}
+
+	mgr := newCacheManager(opt)
+	globalCacheManager.Store(mgr)
 }
 
 // TryEnableResolverCache adds a caching layer on top of the supplied resolver when enabled.
 func TryEnableResolverCache(in IDNSResolver) IDNSResolver {
-	if in == nil {
-		return nil
+	return cacheResolver{next: in}
+}
+
+func (c cacheResolver) Name() string {
+	return fmt.Sprintf("cache(%s)", c.next.Name())
+}
+
+func (c cacheResolver) Query(ctx context.Context, req *dns.Msg) (*dns.Msg, error) {
+	v, ok := globalCacheManager.Load().(*cacheManager)
+	if !ok {
+		return c.next.Query(ctx, req)
 	}
-	opt := globalCacheOptions.Load().(CacheOptions)
-	if opt.Size <= 0 {
-		return in
-	}
-	return newCacheResolver(in, opt)
+	return v.Query(ctx, c.next, req)
 }
 
 type cacheResolver struct {
-	next     IDNSResolver
+	next IDNSResolver
+}
+
+type cacheManager struct {
+	ch       chan bool
+	wg       sync.WaitGroup
 	cfg      CacheOptions
 	cache    *lru.Cache[string, *cacheEntry]
 	mu       sync.Mutex
@@ -72,15 +90,14 @@ type cacheEntry struct {
 	expire time.Time
 }
 
-func newCacheResolver(next IDNSResolver, cfg CacheOptions) *cacheResolver {
+func newCacheManager(cfg CacheOptions) *cacheManager {
 	lruCache, err := lru.New[string, *cacheEntry](int(cfg.Size))
 	if err != nil {
-		logutil.GetLogger(context.Background()).Error("init lru failed", zap.Error(err))
-		return &cacheResolver{next: next, cfg: CacheOptions{}}
+		panic(fmt.Errorf("init lru failed, err:%w", err)) //should not reach here
 	}
-	c := &cacheResolver{
-		next:     next,
+	c := &cacheManager{
 		cfg:      cfg,
+		ch:       make(chan bool),
 		cache:    lruCache,
 		inflight: make(map[string]struct{}),
 	}
@@ -88,16 +105,21 @@ func newCacheResolver(next IDNSResolver, cfg CacheOptions) *cacheResolver {
 		if err := c.loadFromFile(); err != nil {
 			logutil.GetLogger(context.Background()).Error("load persist file failed", zap.Error(err))
 		}
-		go c.persistLoop()
+		c.wg.Add(1)
+		go func() {
+			defer c.wg.Done()
+			c.persistLoop(cfg.Interval)
+		}()
 	}
 	return c
 }
 
-func (c *cacheResolver) Name() string {
-	return fmt.Sprintf("cache(%s)", c.next.Name())
+func (c *cacheManager) Close() {
+	close(c.ch)
+	c.wg.Wait()
 }
 
-func (c *cacheResolver) Query(ctx context.Context, req *dns.Msg) (*dns.Msg, error) {
+func (c *cacheManager) Query(ctx context.Context, qr IDNSResolver, req *dns.Msg) (*dns.Msg, error) {
 	key := c.buildCacheKey(req)
 	msg, expired, found := c.get(ctx, key)
 	if found {
@@ -109,13 +131,13 @@ func (c *cacheResolver) Query(ctx context.Context, req *dns.Msg) (*dns.Msg, erro
 		}
 		if c.cfg.Lazy {
 			logutil.GetLogger(ctx).Debug("use expire dns response from cache, start refresh it")
-			c.scheduleRefresh(ctx, key, req.Copy())
+			c.scheduleRefresh(ctx, qr, key, req.Copy())
 			return msg, nil
 		}
 		c.remove(key)
 	}
 
-	resp, err := c.next.Query(ctx, req)
+	resp, err := qr.Query(ctx, req)
 	if err != nil {
 		return nil, err
 	}
@@ -123,7 +145,7 @@ func (c *cacheResolver) Query(ctx context.Context, req *dns.Msg) (*dns.Msg, erro
 	return resp, nil
 }
 
-func (c *cacheResolver) get(ctx context.Context, key string) (*dns.Msg, bool, bool) {
+func (c *cacheManager) get(ctx context.Context, key string) (*dns.Msg, bool, bool) {
 	c.mu.Lock()
 	entry, ok := c.cache.Get(key)
 	if !ok {
@@ -148,14 +170,14 @@ func (c *cacheResolver) get(ctx context.Context, key string) (*dns.Msg, bool, bo
 	return msg, expired, true
 }
 
-func (c *cacheResolver) remove(key string) {
+func (c *cacheManager) remove(key string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.cache.Remove(key)
 	c.dirty = true
 }
 
-func (c *cacheResolver) store(key string, msg *dns.Msg) {
+func (c *cacheManager) store(key string, msg *dns.Msg) {
 	ttl, ok := c.extractTTL(msg)
 	if !ok || ttl == 0 {
 		return
@@ -177,7 +199,7 @@ func (c *cacheResolver) store(key string, msg *dns.Msg) {
 	c.dirty = true
 }
 
-func (c *cacheResolver) scheduleRefresh(oldctx context.Context, key string, req *dns.Msg) {
+func (c *cacheManager) scheduleRefresh(oldctx context.Context, qr IDNSResolver, key string, req *dns.Msg) {
 	c.mu.Lock()
 	if _, ok := c.inflight[key]; ok {
 		c.mu.Unlock()
@@ -195,12 +217,12 @@ func (c *cacheResolver) scheduleRefresh(oldctx context.Context, key string, req 
 		}()
 		ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		defer cancel()
-		resp, err := c.next.Query(ctx, req)
+		resp, err := qr.Query(ctx, req)
 		if err != nil {
-			logutil.GetLogger(ctx).Error("lazy cache update but refresh failed", zap.Error(err), zap.String("key", key))
+			logutil.GetLogger(ctx).Error("lazy cache update but refresh failed", zap.Error(err), zap.String("key", key), zap.String("resolver", qr.Name()))
 			return
 		}
-		logutil.GetLogger(ctx).Debug("lazy cache update succ", zap.String("key", key))
+		logutil.GetLogger(ctx).Debug("lazy cache update succ", zap.String("key", key), zap.String("resolver", qr.Name()))
 		c.store(key, resp)
 	}()
 }
@@ -211,7 +233,7 @@ type persistRecord struct {
 	Msg    []byte `json:"msg"`
 }
 
-func (c *cacheResolver) persist(ctx context.Context) {
+func (c *cacheManager) persist(ctx context.Context) {
 	snapshot := c.snapshot()
 	path := strings.TrimSpace(c.cfg.File)
 	if path == "" {
@@ -253,7 +275,7 @@ func (c *cacheResolver) persist(ctx context.Context) {
 	logutil.GetLogger(ctx).Info("save persist dns cache file succ", zap.Int("record_count", len(snapshot)))
 }
 
-func (c *cacheResolver) snapshot() []persistRecord {
+func (c *cacheManager) snapshot() []persistRecord {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	values := c.cache.Values()
@@ -268,23 +290,29 @@ func (c *cacheResolver) snapshot() []persistRecord {
 	return records
 }
 
-func (c *cacheResolver) persistLoop() {
-	ticker := time.NewTicker(persistInterval)
+func (c *cacheManager) persistLoop(interval time.Duration) {
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	ctx := context.Background()
-	for range ticker.C {
-		c.mu.Lock()
-		if !c.dirty {
+	for {
+		select {
+		case <-ticker.C:
+			c.mu.Lock()
+			if !c.dirty {
+				c.mu.Unlock()
+				continue
+			}
+			c.dirty = false
 			c.mu.Unlock()
-			continue
+			c.persist(ctx)
+		case <-c.ch:
+			logutil.GetLogger(ctx).Debug("persist thread exit")
+			return
 		}
-		c.dirty = false
-		c.mu.Unlock()
-		c.persist(ctx)
 	}
 }
 
-func (c *cacheResolver) loadFromFile() error {
+func (c *cacheManager) loadFromFile() error {
 	if c.cache == nil {
 		return nil
 	}
@@ -332,7 +360,7 @@ func (c *cacheResolver) loadFromFile() error {
 	return nil
 }
 
-func (c *cacheResolver) buildCacheKey(req *dns.Msg) string {
+func (c *cacheManager) buildCacheKey(req *dns.Msg) string {
 	if req == nil || len(req.Question) == 0 {
 		return ""
 	}
@@ -344,7 +372,7 @@ func (c *cacheResolver) buildCacheKey(req *dns.Msg) string {
 	return fmt.Sprintf("%s|%d|%d", domain, q.Qtype, q.Qclass)
 }
 
-func (c *cacheResolver) extractTTL(msg *dns.Msg) (uint32, bool) {
+func (c *cacheManager) extractTTL(msg *dns.Msg) (uint32, bool) {
 	var minTTL uint32
 	found := false
 
@@ -373,7 +401,7 @@ func (c *cacheResolver) extractTTL(msg *dns.Msg) (uint32, bool) {
 	return minTTL, found
 }
 
-func (c *cacheResolver) adjustTTL(msg *dns.Msg, ttl uint32) {
+func (c *cacheManager) adjustTTL(msg *dns.Msg, ttl uint32) {
 	for _, rr := range msg.Answer {
 		if rr.Header().Ttl > ttl {
 			rr.Header().Ttl = ttl

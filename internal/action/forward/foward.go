@@ -49,7 +49,7 @@ func createForwardAction(name string, args interface{}) (action.IDNSAction, erro
 	if err != nil {
 		return nil, err
 	}
-	r := resolver.NewGroupResolver(res, c.Parallel)
+	r := resolver.NewGroupResolver(name, res, c.Parallel)
 	r = resolver.TryEnableResolverCache(r)
 	return &forwardAction{name: name, r: r}, nil
 }

@@ -64,10 +64,10 @@ func (p *groupResolver) Query(ctx context.Context, req *dns.Msg) (*dns.Msg, erro
 	return nil, fmt.Errorf("no err return and no dns record found?")
 }
 
-func NewGroupResolver(res []IDNSResolver, concurrent int) IDNSResolver {
-	return &groupResolver{name: buildGroupName(res, concurrent), res: res, concurrent: concurrent}
+func NewGroupResolver(name string, res []IDNSResolver, concurrent int) IDNSResolver {
+	return &groupResolver{name: buildGroupName(name, res, concurrent), res: res, concurrent: concurrent}
 }
 
-func buildGroupName(res []IDNSResolver, cc int) string {
-	return fmt.Sprintf("group:{%d:%d}", len(res), cc)
+func buildGroupName(name string, res []IDNSResolver, cc int) string {
+	return fmt.Sprintf("group:{%s:%d:%d}", name, len(res), cc)
 }

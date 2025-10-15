@@ -10,6 +10,7 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/xxxsen/atlas/internal/action"
 	_ "github.com/xxxsen/atlas/internal/action/register"
@@ -38,10 +39,11 @@ func main() {
 	defer logkit.Sync() //nolint:errcheck
 
 	resolver.ConfigureCache(resolver.CacheOptions{
-		Size:    cfg.Cache.Size,
-		Lazy:    cfg.Cache.Lazy,
-		Persist: cfg.Cache.Persist,
-		File:    cfg.Cache.File,
+		Size:     cfg.Cache.Size,
+		Lazy:     cfg.Cache.Lazy,
+		Persist:  cfg.Cache.Persist,
+		File:     cfg.Cache.File,
+		Interval: time.Duration(cfg.Cache.Interval) * time.Second,
 	})
 
 	ms, err := buildMatcherMap(cfg.Resource.Matcher)
