@@ -81,7 +81,7 @@ resource:
       type: rcode
       data:
         code: 5 # REFUSED
-rules:
+rule:
   - remark: prefer local
     match: local
     action: forward-local
