@@ -126,7 +126,7 @@ func (c *cacheManager) Query(ctx context.Context, qr IDNSResolver, req *dns.Msg)
 		msg.Id = req.Id
 		msg.Question = append([]dns.Question(nil), req.Question...)
 		if !expired {
-			logutil.GetLogger(ctx).Debug("read dns response from cache")
+			logutil.GetLogger(ctx).Debug("read dns response from cache", zap.String("next_resolver", qr.Name()))
 			return msg, nil
 		}
 		if c.cfg.Lazy {
@@ -181,6 +181,9 @@ func (c *cacheManager) store(key string, msg *dns.Msg) {
 	ttl, ok := c.extractTTL(msg)
 	if !ok || ttl == 0 {
 		return
+	}
+	if len(msg.Answer) == 0 { //没有响应的, 不加缓存, 避免尴尬
+		return 
 	}
 	packed, err := msg.Pack()
 	if err != nil {
