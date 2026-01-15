@@ -43,14 +43,14 @@ func TestGroupResolver(t *testing.T) {
 	success := &stubDNSResolver{}
 	fail := &stubDNSResolver{err: errors.New("failure")}
 
-	group := NewGroupResolver([]IDNSResolver{fail, success}, 2)
+	group := NewGroupResolver("a", []IDNSResolver{fail, success}, 2)
 	req := new(dns.Msg)
 	req.SetQuestion("example.com.", dns.TypeA)
 	if _, err := group.Query(context.Background(), req); err != nil {
 		t.Fatalf("group.Query error: %v", err)
 	}
 
-	groupFail := NewGroupResolver([]IDNSResolver{fail}, 1)
+	groupFail := NewGroupResolver("a", []IDNSResolver{fail}, 1)
 	if _, err := groupFail.Query(context.Background(), req); err == nil {
 		t.Fatalf("expected group resolver failure")
 	}

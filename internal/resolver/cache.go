@@ -38,7 +38,7 @@ func init() {
 
 // ConfigureCache sets the global cache options that will be used when wrapping resolvers.
 func ConfigureCache(opt CacheOptions) {
-	if opt.Size < 0 {
+	if opt.Size <= 0 {
 		opt.Size = 1000
 	}
 	if opt.Interval == 0 {
