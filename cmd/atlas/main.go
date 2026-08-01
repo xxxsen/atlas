@@ -23,86 +23,176 @@ import (
 	"github.com/xxxsen/atlas/internal/server"
 	"github.com/xxxsen/common/logger"
 	"go.uber.org/zap"
+	"golang.org/x/sync/errgroup"
+)
+
+var (
+	version   = "dev"
+	commit    = "unknown"
+	buildDate = "unknown"
 )
 
 func main() {
 	cfgPath := flag.String("config", "", "path to YAML configuration file")
+	showVersion := flag.Bool("version", false, "print version information and exit")
 	flag.Parse()
+	if *showVersion {
+		fmt.Printf("atlas %s (commit %s, built %s)\n", version, commit, buildDate)
+		return
+	}
+	if err := run(*cfgPath); err != nil {
+		log.Printf("atlas stopped with error: %v", err)
+		os.Exit(1)
+	}
+}
 
-	cfg, err := config.Load(*cfgPath)
+func run(configPath string) (returnErr error) {
+	cfg, err := config.Load(configPath)
 	if err != nil {
-		// logger not initialised yet, fallback to stderr
-		log.Fatalf("init config failed, err:%v", err)
+		return fmt.Errorf("initialize config: %w", err)
 	}
 	logkit := logger.Init(cfg.Log.File, cfg.Log.Level, int(cfg.Log.FileCount),
 		int(cfg.Log.FileSize), int(cfg.Log.KeepDays), cfg.Log.Console)
-	defer logkit.Sync() //nolint:errcheck
+	defer func() {
+		if err := logkit.Sync(); err != nil && !errors.Is(err, syscall.EINVAL) && !errors.Is(err, syscall.ENOTTY) && returnErr == nil {
+			returnErr = fmt.Errorf("flush logger: %w", err)
+		}
+	}()
 
-	resolver.ConfigureCache(resolver.CacheOptions{
-		Size:     cfg.Cache.Size,
-		Lazy:     cfg.Cache.Lazy,
-		Persist:  cfg.Cache.Persist,
-		File:     cfg.Cache.File,
-		Interval: time.Duration(cfg.Cache.Interval) * time.Second,
-	})
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	var cacheManager *resolver.CacheManager
+	if cfg.Cache.Size > 0 {
+		fingerprint, err := cfg.Fingerprint()
+		if err != nil {
+			return err
+		}
+		cacheManager, err = resolver.NewCacheManager(ctx, resolver.CacheOptions{
+			Size:               cfg.Cache.Size,
+			MaxBytes:           cfg.Cache.MaxBytes,
+			MaxEntryBytes:      cfg.Cache.MaxEntryBytes,
+			Lazy:               cfg.Cache.Lazy,
+			MaxStale:           time.Duration(cfg.Cache.MaxStale) * time.Second,
+			Persist:            cfg.Cache.Persist,
+			File:               cfg.Cache.File,
+			Interval:           time.Duration(cfg.Cache.Interval) * time.Second,
+			RefreshConcurrency: cfg.Cache.RefreshConcurrency,
+			NegativeTTLMax:     time.Duration(cfg.Cache.NegativeTTLMax) * time.Second,
+			Fingerprint:        fingerprint,
+		})
+		if err != nil {
+			return fmt.Errorf("initialize cache: %w", err)
+		}
+		if warning := cacheManager.LastPersistenceError(); warning != nil {
+			logkit.Warn("discarded unusable DNS cache persistence data", zap.Error(warning))
+		}
+		defer func() {
+			closeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := cacheManager.Close(closeCtx); err != nil {
+				returnErr = errors.Join(returnErr, fmt.Errorf("close cache: %w", err))
+			}
+		}()
+	}
 
 	ms, err := buildMatcherMap(cfg.Resource.Matcher)
 	if err != nil {
-		logkit.Fatal("build matcher map failed", zap.Error(err))
+		return fmt.Errorf("build matcher map: %w", err)
 	}
-	as, err := buildActionMap(cfg.Resource.Action)
+	as, err := buildActionMap(cfg.Resource.Action, action.Dependencies{Cache: cacheManager})
 	if err != nil {
-		logkit.Fatal("build action map failed", zap.Error(err))
+		return fmt.Errorf("build action map: %w", err)
 	}
+	defer func() {
+		returnErr = errors.Join(returnErr, closeActions(as))
+	}()
 	hosts, err := buildHostStore(cfg.Resource.Host)
 	if err != nil {
-		logkit.Fatal("build host store failed", zap.Error(err))
+		return fmt.Errorf("build host store: %w", err)
 	}
 	engine, err := buildRuleEngine(cfg.Rule, ms, as)
 	if err != nil {
-		logkit.Fatal("build rule engine failed", zap.Error(err))
+		return fmt.Errorf("build rule engine: %w", err)
 	}
 
 	serverOpts := []server.Option{
 		server.WithBind(cfg.Bind),
 		server.WithHostResolver(hosts),
 		server.WithRuleEngine(engine),
+		server.WithUDPSize(cfg.Server.UDPSize),
+		server.WithMaxResponseUDPSize(cfg.Server.MaxResponseUDPSize),
+		server.WithMaxInflight(cfg.Server.MaxInflight),
+		server.WithRequestTimeout(time.Duration(cfg.Server.RequestTimeout) * time.Second),
+		server.WithClientRateLimit(cfg.Server.RateLimitQPS, cfg.Server.RateLimitBurst, cfg.Server.RateLimitClients),
+		server.WithAllowedCIDRs(cfg.Server.AllowedCIDRs),
 	}
 
 	forwarder, err := server.New(serverOpts...)
 	if err != nil {
-		logkit.Fatal("initialise server failed", zap.Error(err))
+		return fmt.Errorf("initialize server: %w", err)
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-
+	group, groupCtx := errgroup.WithContext(ctx)
+	group.Go(func() error { return forwarder.Start(groupCtx) })
 	if cfg.Pprof.Enable {
-		startPprofServer(ctx, cfg.Pprof.Bind, logkit)
+		group.Go(func() error {
+			return runPprofServer(groupCtx, cfg.Pprof.Bind, logkit, func() any {
+				snapshot := struct {
+					DNS   server.Stats         `json:"dns"`
+					Cache *resolver.CacheStats `json:"cache,omitempty"`
+				}{DNS: forwarder.Stats()}
+				if cacheManager != nil {
+					stats := cacheManager.Stats()
+					snapshot.Cache = &stats
+				}
+				return snapshot
+			})
+		})
 	}
-
-	logkit.Info("start dns forwarder server", zap.String("addr", cfg.Bind))
-	if err := forwarder.Start(ctx); err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, syscall.EINTR) {
-		logkit.Fatal("server error", zap.Error(err))
+	logkit.Info("starting DNS forwarder server", zap.String("addr", cfg.Bind))
+	if err := group.Wait(); err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, syscall.EINTR) {
+		return fmt.Errorf("server runtime: %w", err)
 	}
 	logkit.Info("shutdown complete")
+	return nil
 }
 
-func buildActionMap(ats []config.ActionConfig) (map[string]action.IDNSAction, error) {
+func buildActionMap(ats []config.ActionConfig, dependencies ...action.Dependencies) (map[string]action.IDNSAction, error) {
 	m := make(map[string]action.IDNSAction, len(ats))
 	for _, at := range ats {
-		inst, err := action.MakeAction(at.Type, at.Name, at.Data)
+		if _, exists := m[at.Name]; exists {
+			return nil, fmt.Errorf("duplicate action name %q", at.Name)
+		}
+		inst, err := action.MakeAction(at.Type, at.Name, at.Data, dependencies...)
 		if err != nil {
-			return nil, fmt.Errorf("make action failed, name:%s, type:%s, err:%w", at.Name, at.Type, err)
+			return nil, errors.Join(fmt.Errorf("make action failed, name:%s, type:%s, err:%w", at.Name, at.Type, err), closeActions(m))
 		}
 		m[at.Name] = inst
 	}
 	return m, nil
 }
 
+func closeActions(actions map[string]action.IDNSAction) error {
+	var errs []error
+	for name, item := range actions {
+		closer, ok := item.(action.Closer)
+		if !ok {
+			continue
+		}
+		if err := closer.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("close action %s: %w", name, err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
 func buildMatcherMap(ms []config.MatcherConfig) (map[string]matcher.IDNSMatcher, error) {
 	rs := make(map[string]matcher.IDNSMatcher, len(ms))
 	for _, m := range ms {
+		if _, exists := rs[m.Name]; exists {
+			return nil, fmt.Errorf("duplicate matcher name %q", m.Name)
+		}
 		inst, err := matcher.MakeMatcher(m.Type, m.Name, m.Data)
 		if err != nil {
 			return nil, err

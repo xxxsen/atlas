@@ -4,6 +4,7 @@ import (
 	"context"
 
 	"github.com/miekg/dns"
+	"github.com/xxxsen/atlas/internal/strictdecode"
 )
 
 type anyMatcher struct {
@@ -30,6 +31,9 @@ func newAnyMatcher(name string) IDNSMatcher {
 }
 
 func createAnyMatcher(name string, args interface{}) (IDNSMatcher, error) {
+	if err := strictdecode.Decode(args, &struct{}{}); err != nil {
+		return nil, err
+	}
 	return newAnyMatcher(name), nil
 }
 

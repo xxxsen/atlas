@@ -29,7 +29,7 @@ func (d *defaultEngine) Execute(ctx context.Context, req *dns.Msg) (*dns.Msg, er
 		logutil.GetLogger(ctx).Debug("match rule", zap.String("rule_remark", r.Name()))
 		res, err := r.Perform(ctx, req)
 		if err != nil {
-			logutil.GetLogger(ctx).Error("perform rule failed", zap.Error(err))
+			logutil.GetLogger(ctx).Debug("perform rule failed", zap.Error(err))
 			return nil, err
 		}
 		logutil.GetLogger(ctx).Debug("perform rule succ")

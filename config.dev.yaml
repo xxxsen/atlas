@@ -1,0 +1,56 @@
+bind: "127.0.0.1:15353"
+server:
+  udp_size: 4096
+  max_response_udp_size: 1232
+  max_inflight: 128
+  request_timeout: 3
+  rate_limit_qps: 0
+  rate_limit_clients: 128
+  allowed_cidrs:
+    - "127.0.0.0/8"
+pprof:
+  enable: true
+  bind: "127.0.0.1:16060"
+cache:
+  size: 1000
+  max_bytes: 16777216
+  max_entry_bytes: 65535
+  lazy: true
+  max_stale: 60
+  persist: true
+  file: ".dev-data/dns-cache.jsonl"
+  interval: 5
+  refresh_concurrency: 4
+  negative_ttl_max: 3600
+resource:
+  host:
+    records:
+      static.test: "192.0.2.53"
+  matcher:
+    - name: blocked
+      type: domain
+      data:
+        domains:
+          - "full:blocked.test"
+  action:
+    - name: forward-dev
+      type: forward
+      data:
+        server_list:
+          - "udp://127.0.0.1:15355?timeout=200"
+          - "udp://127.0.0.1:15354?timeout=1000"
+        parallel: 1
+    - name: refuse
+      type: rcode
+      data:
+        code: 5
+rule:
+  - remark: block test domain
+    match: blocked
+    action: refuse
+  - remark: deterministic local upstream
+    match: any
+    action: forward-dev
+log:
+  level: info
+  console: true

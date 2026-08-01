@@ -1,76 +1,129 @@
 package matcher
 
-type ahoNode struct {
-	children map[byte]*ahoNode
-	fail     *ahoNode
+import "sort"
+
+type ahoBuildNode struct {
+	children map[byte]uint32
+	fail     uint32
 	output   bool
 }
 
+type ahoNode struct {
+	edgeStart uint32
+	edgeCount uint32
+	fail      uint32
+	output    bool
+}
+
+type ahoEdge struct {
+	character byte
+	next      uint32
+}
+
+// ahoMatcher freezes its construction maps into sorted contiguous edges.
+// Matching then performs no allocation and keeps failure links as indexes,
+// avoiding one heap object and one map per byte of every keyword.
 type ahoMatcher struct {
-	root        *ahoNode
+	building    []ahoBuildNode
+	nodes       []ahoNode
+	edges       []ahoEdge
 	patterns    int
 	constructed bool
 }
 
 func newAhoMatcher() *ahoMatcher {
-	return &ahoMatcher{root: newAhoNode()}
-}
-
-func newAhoNode() *ahoNode {
-	return &ahoNode{children: make(map[byte]*ahoNode)}
+	return &ahoMatcher{building: []ahoBuildNode{{}}}
 }
 
 func (a *ahoMatcher) add(pattern string) {
 	if pattern == "" {
 		return
 	}
-	node := a.root
-	for i := 0; i < len(pattern); i++ {
-		ch := pattern[i]
-		child, ok := node.children[ch]
-		if !ok {
-			child = newAhoNode()
-			node.children[ch] = child
-		}
-		node = child
+	if a.constructed {
+		panic("cannot add an Aho pattern after the matcher is frozen")
 	}
-	if !node.output {
-		node.output = true
+	current := uint32(0)
+	for i := 0; i < len(pattern); i++ {
+		node := &a.building[current]
+		if node.children == nil {
+			node.children = make(map[byte]uint32)
+		}
+		next, ok := node.children[pattern[i]]
+		if !ok {
+			next = uint32(len(a.building))
+			node.children[pattern[i]] = next
+			a.building = append(a.building, ahoBuildNode{})
+		}
+		current = next
+	}
+	if !a.building[current].output {
+		a.building[current].output = true
 		a.patterns++
 	}
-	a.constructed = false
 }
 
 func (a *ahoMatcher) build() {
-	if a.constructed || a.patterns == 0 {
-		a.constructed = true
+	if a.constructed {
 		return
 	}
-	queue := make([]*ahoNode, 0, len(a.root.children))
-	for _, child := range a.root.children {
-		child.fail = a.root
+	queue := make([]uint32, 0)
+	for _, child := range a.building[0].children {
+		a.building[child].fail = 0
 		queue = append(queue, child)
 	}
-	for len(queue) > 0 {
-		node := queue[0]
-		queue = queue[1:]
-		for ch, child := range node.children {
-			fail := node.fail
-			for fail != nil && fail.children[ch] == nil {
-				fail = fail.fail
+	for head := 0; head < len(queue); head++ {
+		current := queue[head]
+		for character, child := range a.building[current].children {
+			fail := a.building[current].fail
+			for fail != 0 {
+				if _, ok := a.building[fail].children[character]; ok {
+					break
+				}
+				fail = a.building[fail].fail
 			}
-			if fail == nil {
-				child.fail = a.root
-			} else {
-				child.fail = fail.children[ch]
+			if next, ok := a.building[fail].children[character]; ok && next != child {
+				a.building[child].fail = next
 			}
-			if child.fail != nil && child.fail.output {
-				child.output = true
+			if a.building[a.building[child].fail].output {
+				a.building[child].output = true
 			}
 			queue = append(queue, child)
 		}
 	}
+
+	a.nodes = make([]ahoNode, len(a.building))
+	for index := range a.building {
+		building := &a.building[index]
+		node := &a.nodes[index]
+		node.fail = building.fail
+		node.output = building.output
+		if len(building.children) == 0 {
+			continue
+		}
+		characters := make([]int, 0, len(building.children))
+		for character := range building.children {
+			characters = append(characters, int(character))
+		}
+		sort.Ints(characters)
+		node.edgeStart = uint32(len(a.edges))
+		node.edgeCount = uint32(len(characters))
+		for _, character := range characters {
+			ch := byte(character)
+			a.edges = append(a.edges, ahoEdge{character: ch, next: building.children[ch]})
+		}
+	}
+	a.building = nil
 	a.constructed = true
+}
+
+func (a *ahoMatcher) transition(node uint32, character byte) (uint32, bool) {
+	item := a.nodes[node]
+	edges := a.edges[item.edgeStart : item.edgeStart+item.edgeCount]
+	index := sort.Search(len(edges), func(i int) bool { return edges[i].character >= character })
+	if index == len(edges) || edges[index].character != character {
+		return 0, false
+	}
+	return edges[index].next, true
 }
 
 func (a *ahoMatcher) match(text string) bool {
@@ -80,18 +133,18 @@ func (a *ahoMatcher) match(text string) bool {
 	if !a.constructed {
 		a.build()
 	}
-	node := a.root
+	current := uint32(0)
 	for i := 0; i < len(text); i++ {
-		ch := text[i]
-		for node != a.root && node.children[ch] == nil {
-			node = node.fail
+		for current != 0 {
+			if _, ok := a.transition(current, text[i]); ok {
+				break
+			}
+			current = a.nodes[current].fail
 		}
-		if next := node.children[ch]; next != nil {
-			node = next
-		} else {
-			node = a.root
+		if next, ok := a.transition(current, text[i]); ok {
+			current = next
 		}
-		if node.output {
+		if a.nodes[current].output {
 			return true
 		}
 	}

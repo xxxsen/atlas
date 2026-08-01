@@ -6,7 +6,7 @@ import (
 
 	geositeprovider "github.com/xxxsen/atlas/internal/data/geosite"
 	mainmatcher "github.com/xxxsen/atlas/internal/matcher"
-	"github.com/xxxsen/common/utils"
+	"github.com/xxxsen/atlas/internal/strictdecode"
 )
 
 func domainToRule(d geositeprovider.Domain) (string, bool) {
@@ -76,7 +76,7 @@ func parseListSpec(spec string) listSpec {
 
 func createGeositeMatcher(name string, args interface{}) (mainmatcher.IDNSMatcher, error) {
 	cfg := &config{}
-	if err := utils.ConvStructJson(args, cfg); err != nil {
+	if err := strictdecode.Decode(args, cfg); err != nil {
 		return nil, err
 	}
 	if cfg.File == "" {

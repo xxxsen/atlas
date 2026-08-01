@@ -103,7 +103,7 @@ type matcherNode struct {
 }
 
 func (m matcherNode) eval(ctx context.Context, req *dns.Msg) (bool, error) {
-	return m.matcher.Match(ctx, req)
+	return Evaluate(ctx, m.matcher, req)
 }
 
 type notNode struct {

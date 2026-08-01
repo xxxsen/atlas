@@ -1,0 +1,9 @@
+.git
+.github
+.cache
+.dev-data
+.vscode
+bin
+td
+*.md
+config.dev.yaml

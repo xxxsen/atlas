@@ -31,4 +31,16 @@ func TestQTypeMatcher(t *testing.T) {
 	if match {
 		t.Fatalf("expected no match for TypeMX")
 	}
+	if m.Name() != "test" {
+		t.Fatalf("matcher name was not retained: %q", m.Name())
+	}
+	if _, err := newQTypeMatcher("empty", nil); err == nil {
+		t.Fatal("empty qtype matcher should fail")
+	}
+	if _, err := createQTypeMatcher("strict", map[string]any{"tyeps": []uint16{dns.TypeA}}); err == nil {
+		t.Fatal("unknown qtype config key should fail")
+	}
+	if _, err := m.Match(context.Background(), nil); err == nil {
+		t.Fatal("nil request should fail")
+	}
 }

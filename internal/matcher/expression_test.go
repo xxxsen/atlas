@@ -2,6 +2,7 @@ package matcher
 
 import (
 	"context"
+	"sync/atomic"
 	"testing"
 
 	"github.com/miekg/dns"
@@ -10,6 +11,35 @@ import (
 type fakeMatcher struct {
 	name   string
 	result bool
+}
+
+type countingMatcher struct {
+	calls atomic.Int64
+}
+
+func (m *countingMatcher) Name() string { return "counting" }
+func (m *countingMatcher) Type() string { return "test" }
+func (m *countingMatcher) Match(context.Context, *dns.Msg) (bool, error) {
+	m.calls.Add(1)
+	return true, nil
+}
+
+func TestRequestMatcherMemoization(t *testing.T) {
+	item := &countingMatcher{}
+	expression, err := BuildExpressionMatcher("counting && counting", map[string]IDNSMatcher{"counting": item})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := new(dns.Msg)
+	request.SetQuestion("memo.test.", dns.TypeA)
+	ctx := WithRequestMeta(context.Background(), request)
+	matched, err := expression.Match(ctx, request)
+	if err != nil || !matched {
+		t.Fatalf("memoized expression failed: matched=%v err=%v", matched, err)
+	}
+	if item.calls.Load() != 1 {
+		t.Fatalf("matcher evaluated %d times; want once", item.calls.Load())
+	}
 }
 
 func (f fakeMatcher) Name() string {
