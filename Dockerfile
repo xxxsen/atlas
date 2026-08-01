@@ -29,7 +29,6 @@ RUN apk add --no-cache ca-certificates tzdata \
 
 COPY --from=builder --chown=atlas:atlas /out/atlas /usr/local/bin/atlas
 
-USER 10001:10001
 WORKDIR /data
 EXPOSE 5353/tcp 5353/udp 6060/tcp
 STOPSIGNAL SIGTERM
