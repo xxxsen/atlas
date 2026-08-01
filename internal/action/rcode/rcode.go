@@ -6,7 +6,7 @@ import (
 
 	"github.com/miekg/dns"
 	"github.com/xxxsen/atlas/internal/action"
-	"github.com/xxxsen/common/utils"
+	"github.com/xxxsen/atlas/internal/strictdecode"
 )
 
 type rcodeAction struct {
@@ -41,11 +41,11 @@ func newRCodeAction(name string, code int) action.IDNSAction {
 	}
 }
 
-const maxRcode = 0x0FFF
+const maxRcode = 0x0F
 
 func createRcodeAction(name string, args interface{}) (action.IDNSAction, error) {
 	cfg := &config{}
-	if err := utils.ConvStructJson(args, cfg); err != nil {
+	if err := strictdecode.Decode(args, cfg); err != nil {
 		return nil, err
 	}
 	code := cfg.Code
@@ -57,5 +57,7 @@ func createRcodeAction(name string, args interface{}) (action.IDNSAction, error)
 }
 
 func init() {
-	action.Register("rcode", createRcodeAction)
+	action.Register("rcode", func(name string, args interface{}, _ action.Dependencies) (action.IDNSAction, error) {
+		return createRcodeAction(name, args)
+	})
 }

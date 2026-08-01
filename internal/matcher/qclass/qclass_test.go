@@ -32,4 +32,13 @@ func TestQClassMatcher(t *testing.T) {
 	if match {
 		t.Fatalf("expected no match for ClassCHAOS")
 	}
+	if _, err := newQClassMatcher("empty", nil); err == nil {
+		t.Fatal("empty qclass matcher should fail")
+	}
+	if _, err := createQClassMatcher("strict", map[string]any{"clases": []uint16{dns.ClassINET}}); err == nil {
+		t.Fatal("unknown qclass config key should fail")
+	}
+	if _, err := m.Match(context.Background(), nil); err == nil {
+		t.Fatal("nil request should fail")
+	}
 }

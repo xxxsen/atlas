@@ -2,10 +2,13 @@ package geosite
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
 )
+
+const maxGeositeFileBytes = 256 * 1024 * 1024
 
 // Provider loads geosite datasets from disk.
 type Provider struct{}
@@ -52,9 +55,22 @@ func (p *Provider) LoadCategories(path string, categories []string) (map[string]
 
 func readFile(path string) ([]byte, error) {
 	cleanPath := filepath.Clean(path)
-	data, err := os.ReadFile(cleanPath)
+	file, err := os.Open(cleanPath)
 	if err != nil {
 		return nil, fmt.Errorf("read geosite file %s: %w", cleanPath, err)
+	}
+	defer file.Close()
+	if info, err := file.Stat(); err != nil {
+		return nil, fmt.Errorf("stat geosite file %s: %w", cleanPath, err)
+	} else if info.Size() > maxGeositeFileBytes {
+		return nil, fmt.Errorf("geosite file %s exceeds %d bytes", cleanPath, maxGeositeFileBytes)
+	}
+	data, err := io.ReadAll(io.LimitReader(file, maxGeositeFileBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("read geosite file %s: %w", cleanPath, err)
+	}
+	if len(data) > maxGeositeFileBytes {
+		return nil, fmt.Errorf("geosite file %s exceeds %d bytes", cleanPath, maxGeositeFileBytes)
 	}
 	return data, nil
 }

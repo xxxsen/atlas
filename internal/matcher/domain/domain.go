@@ -10,16 +10,21 @@ import (
 
 	"github.com/miekg/dns"
 	"github.com/xxxsen/atlas/internal/matcher"
-	"github.com/xxxsen/common/utils"
+	"github.com/xxxsen/atlas/internal/strictdecode"
 )
 
 type domainMatcher struct {
-	name   string
-	full   *domainTrie
-	suffix *domainTrie
-	kw     *ahoMatcher
-	reg    []*regexp.Regexp
+	name  string
+	index *domainTrie
+	kw    *ahoMatcher
+	reg   []*regexp.Regexp
 }
+
+const (
+	maxDomainRules = 1_000_000
+	maxRegexRules  = 10_000
+	maxRegexLength = 4096
+)
 
 func (d *domainMatcher) Name() string {
 	return d.name
@@ -30,11 +35,12 @@ func (d *domainMatcher) Type() string {
 }
 
 func (d *domainMatcher) Match(ctx context.Context, req *dns.Msg) (bool, error) {
-	name := strings.ToLower(matcher.NormalizeDomain(req.Question[0].Name))
-	if d.full.matchExact(name) {
-		return true, nil
+	if req == nil || len(req.Question) != 1 {
+		return false, fmt.Errorf("domain matcher requires exactly one DNS question")
 	}
-	if d.suffix.matchSuffix(name) {
+	name := matcher.NormalizedRequestName(ctx, req)
+	exact, suffix := d.index.match(name)
+	if exact || suffix {
 		return true, nil
 	}
 	if d.kw.match(name) {
@@ -58,6 +64,14 @@ func (d *domainMatcher) extractKindData(in string) (string, string) {
 }
 
 func (d *domainMatcher) init(drs []string) error {
+	if len(drs) == 0 {
+		return fmt.Errorf("domain matcher requires at least one rule")
+	}
+	if len(drs) > maxDomainRules {
+		return fmt.Errorf("domain matcher has %d rules; maximum is %d", len(drs), maxDomainRules)
+	}
+	seen := make(map[string]struct{}, len(drs))
+	regexCount := 0
 	for _, dr := range drs {
 		if len(dr) == 0 {
 			return fmt.Errorf("nil domain found")
@@ -67,15 +81,39 @@ func (d *domainMatcher) init(drs []string) error {
 			return fmt.Errorf("invalid rule:%s", dr)
 		}
 		normalized := strings.ToLower(matcher.NormalizeDomain(data))
+		key := kind + "\x00" + normalized
+		if kind == "regexp" {
+			key = kind + "\x00" + data
+		}
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
 		switch kind {
 		case "suffix":
-			d.suffix.add(normalized)
+			if _, ok := dns.IsDomainName(dns.Fqdn(normalized)); !ok {
+				return fmt.Errorf("invalid suffix domain %q", data)
+			}
+			d.index.add(normalized)
 		case "keyword":
+			if len(data) > 253 {
+				return fmt.Errorf("domain keyword is too long")
+			}
 			d.kw.add(strings.ToLower(data))
 		case "full":
-			d.full.add(normalized)
+			if _, ok := dns.IsDomainName(dns.Fqdn(normalized)); !ok {
+				return fmt.Errorf("invalid full domain %q", data)
+			}
+			d.index.addExact(normalized)
 		case "regexp":
-			exp, err := regexp.Compile(data)
+			regexCount++
+			if regexCount > maxRegexRules {
+				return fmt.Errorf("domain matcher has more than %d regular expressions", maxRegexRules)
+			}
+			if len(data) > maxRegexLength {
+				return fmt.Errorf("domain regular expression exceeds %d bytes", maxRegexLength)
+			}
+			exp, err := regexp.Compile("(?i:" + data + ")")
 			if err != nil {
 				return err
 			}
@@ -89,21 +127,21 @@ func (d *domainMatcher) init(drs []string) error {
 
 func newDomainMatcher(name string, drs []string) (matcher.IDNSMatcher, error) {
 	d := &domainMatcher{
-		name:   name,
-		full:   newDomainTrie(),
-		suffix: newDomainTrie(),
-		kw:     newAhoMatcher(),
+		name:  name,
+		index: newDomainTrie(),
+		kw:    newAhoMatcher(),
 	}
 	if err := d.init(drs); err != nil {
 		return nil, err
 	}
+	d.index.freeze()
 	d.kw.build()
 	return d, nil
 }
 
 func createDomainMatcher(name string, args interface{}) (matcher.IDNSMatcher, error) {
 	c := &config{}
-	if err := utils.ConvStructJson(args, c); err != nil {
+	if err := strictdecode.Decode(args, c); err != nil {
 		return nil, err
 	}
 	domains := make([]string, 0, len(c.Domains))
@@ -113,6 +151,9 @@ func createDomainMatcher(name string, args interface{}) (matcher.IDNSMatcher, er
 		return nil, err
 	}
 	domains = append(domains, fileDomains...)
+	if len(domains) > maxDomainRules {
+		return nil, fmt.Errorf("domain matcher has %d rules; maximum is %d", len(domains), maxDomainRules)
+	}
 	return newDomainMatcher(name, domains)
 }
 

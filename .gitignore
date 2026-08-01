@@ -1,5 +1,9 @@
 .gocache/
 .gomodcache/
+.cache/
+.dev-data/
+bin/
 plan*.md
 .vscode/
 __debug_bin*
+/td

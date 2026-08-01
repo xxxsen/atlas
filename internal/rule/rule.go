@@ -25,7 +25,7 @@ func (d defaultRule) Perform(ctx context.Context, req *dns.Msg) (*dns.Msg, error
 }
 
 func (d defaultRule) Match(ctx context.Context, req *dns.Msg) (bool, error) {
-	return d.mat.Match(ctx, req)
+	return matcher.Evaluate(ctx, d.mat, req)
 }
 
 func (d defaultRule) Name() string {

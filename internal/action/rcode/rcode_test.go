@@ -30,4 +30,10 @@ func TestRcodeActionInvalidCode(t *testing.T) {
 	if _, err := createRcodeAction("invalid", &config{Code: -1}); err == nil {
 		t.Fatalf("expected error for invalid code")
 	}
+	if _, err := createRcodeAction("extended", &config{Code: 16}); err == nil {
+		t.Fatal("extended RCODE without EDNS must be rejected")
+	}
+	if _, err := createRcodeAction("strict", map[string]any{"cod": 5}); err == nil {
+		t.Fatal("unknown rcode config key should fail")
+	}
 }
