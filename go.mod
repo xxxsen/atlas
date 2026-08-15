@@ -2,7 +2,7 @@ module github.com/xxxsen/atlas
 
 go 1.25.0
 
-toolchain go1.26.5
+toolchain go1.26.6
 
 require (
 	github.com/hashicorp/golang-lru/v2 v2.0.7

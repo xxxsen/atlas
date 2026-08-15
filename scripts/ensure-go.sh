@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-VERSION="${ATLAS_GO_VERSION:-1.26.5}"
+VERSION="${ATLAS_GO_VERSION:-1.26.6}"
 TARGET="$ROOT/.cache/go-runtime"
 GO_BIN="$TARGET/bin/go"
 
@@ -23,8 +23,8 @@ if [[ "$os" != "linux" ]]; then
 fi
 
 case "${VERSION}-${os}-${arch}" in
-  1.26.5-linux-amd64) expected="5c2c3b16caefa1d968a94c1daca04a7ca301a496d9b086e17ad77bb81393f053" ;;
-  1.26.5-linux-arm64) expected="fe4789e92b1f33358680864bbe8704289e7bb5fc207d80623c308935bd696d49" ;;
+  1.26.6-linux-amd64) expected="708effb774be8237570d0add163225abbdfaf4fca28b2611df167beba4feef89" ;;
+  1.26.6-linux-arm64) expected="d0507e9e9d7fe012aae570108cbd76c15de879e17130ab8cb90d4d7445cb1f2e" ;;
   *) echo "no pinned checksum for Go ${VERSION} ${os}/${arch}" >&2; exit 1 ;;
 esac
 
