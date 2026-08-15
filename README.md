@@ -48,7 +48,7 @@ bind: "127.0.0.1:5353"
 server:
   udp_size: 4096
   max_response_udp_size: 1232
-  max_inflight: 1024
+  max_inflight: 256
   request_timeout: 10       # 秒
   rate_limit_qps: 100       # 0 表示关闭按客户端限速
   rate_limit_burst: 200
@@ -108,7 +108,7 @@ resource:
       type: forward
       data:
         server_list:
-          - "https://1.1.1.1/dns-query?timeout=2500&max_conns=100&max_inflight=100"
+          - "https://1.1.1.1/dns-query?timeout=2500&max_conns=16&max_inflight=16"
           - "dot://9.9.9.9:853?timeout=2500&pool=16&max_inflight=16"
         parallel: 2
 
@@ -151,7 +151,7 @@ UDP/TCP listener
 
 - 同一请求交给多个上游前会逐一复制 `dns.Msg`，不会并发共享可变 EDNS 数据。
 - 解析组维持至多 `parallel` 个在途查询；失败或 SERVFAIL/REFUSED 等无效结果会由剩余上游补位，首个有效响应成为唯一结果。
-- 每个 resolver 还有独立 `max_inflight` 上限。TCP/DoT 使用独占、有界连接池；UDP 收到 `TC=1` 会自动用 TCP 重试；DoH 显式启用 HTTP/2 并限制连接数和响应体为 65535 字节。
+- 每个 resolver 还有独立 `max_inflight` 上限。TCP/DoT 使用独占、有界连接池；UDP 收到 `TC=1` 会自动用 TCP 重试；DoH 显式启用 HTTP/2、PING 健康检查和故障连接代际重建，并限制连接数和响应体为 65535 字节。
 - 入站 UDP 无 EDNS 时按 512 字节响应；有 EDNS 时采用客户端声明值，但不超过 `max_response_udp_size`。TCP 响应不截断。
 
 ## Resolver URL
@@ -161,7 +161,7 @@ UDP/TCP listener
 | `udp` | `udp://1.1.1.1:53` | UDP，截断自动回退 TCP |
 | `tcp` | `tcp://1.1.1.1:53?pool=16` | 有界长连接池 |
 | `dot` | `dot://1.1.1.1:853?pool=16` | TLS 1.2+，有界长连接池 |
-| `https` | `https://1.1.1.1/dns-query?max_conns=100` | HTTP/2，连接复用 |
+| `https` | `https://1.1.1.1/dns-query?max_conns=16` | HTTP/2，连接复用与故障自愈 |
 
 本地 transport 参数：
 
@@ -171,6 +171,8 @@ UDP/TCP listener
 - `max_inflight`：所有 resolver，最大 100000。
 
 DoH URL 中除这些保留参数之外的 query 参数会原样保留，可用于上游路由 token。classic resolver 不接受路径或额外 query 参数。所有 URL 在启动期完成 scheme、host、port、参数和路径校验。
+
+未配置 transport 参数时，DoH 默认请求超时 4 秒、连接/响应头阶段超时 2/3 秒、单上游 `max_conns=max_inflight=16`。上游连续失败后自动熔断，退避从 1 秒增长到最多 10 秒；冷却结束只放行一个恢复探测。这些自愈参数当前使用面向家庭网络的内置安全默认值，不要求修改现有 YAML。
 
 ## Matcher 与规则
 

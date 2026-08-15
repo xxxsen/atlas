@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/miekg/dns"
 	"github.com/xxxsen/common/logutil"
@@ -33,6 +34,58 @@ type groupResult struct {
 	resolver string
 }
 
+type groupAttempt struct {
+	resolver IDNSResolver
+	request  *dns.Msg
+}
+
+func (p *groupResolver) buildAttempts(req *dns.Msg) []groupAttempt {
+	ordered := make([]IDNSResolver, 0, len(p.res))
+	start := int((p.next.Add(1) - 1) % uint64(len(p.res)))
+	for index := range p.res {
+		ordered = append(ordered, p.res[(start+index)%len(p.res)])
+	}
+
+	healthy := make([]IDNSResolver, 0, len(ordered))
+	var readyProbe IDNSResolver
+	var readyProbeAt time.Time
+	for _, child := range ordered {
+		reporter, ok := child.(healthReportingResolver)
+		if !ok {
+			healthy = append(healthy, child)
+			continue
+		}
+		health := reporter.resolverHealth()
+		if !health.Available {
+			continue
+		}
+		if health.RetryAt.IsZero() {
+			healthy = append(healthy, child)
+			continue
+		}
+		if readyProbe == nil || health.RetryAt.Before(readyProbeAt) {
+			readyProbe = child
+			readyProbeAt = health.RetryAt
+		}
+	}
+
+	available := healthy
+	if len(healthy) == 0 && readyProbe != nil {
+		// If no known-healthy endpoint remains, allow exactly one expired circuit
+		// to probe. Circuits whose retry time has not arrived are omitted entirely.
+		available = []IDNSResolver{readyProbe}
+	} else if len(healthy) > 0 && p.concurrent > 1 && readyProbe != nil {
+		// Spend at most one parallel slot relearning a recovered endpoint without
+		// delaying the only known-healthy path in a serial group.
+		available = append([]IDNSResolver{readyProbe}, healthy...)
+	}
+	attempts := make([]groupAttempt, len(available))
+	for index, child := range available {
+		attempts[index] = groupAttempt{resolver: child, request: req.Copy()}
+	}
+	return attempts
+}
+
 func (p *groupResolver) Query(ctx context.Context, req *dns.Msg) (*dns.Msg, error) {
 	if ctx == nil {
 		return nil, fmt.Errorf("group resolver context is nil")
@@ -46,17 +99,11 @@ func (p *groupResolver) Query(ctx context.Context, req *dns.Msg) (*dns.Msg, erro
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	// dns.Msg is mutable: Pack updates EDNS OPT state. Copy every request before
-	// any worker starts so concurrent transports never share mutable records.
-	attempts := make([]struct {
-		resolver IDNSResolver
-		request  *dns.Msg
-	}, len(p.res))
-	start := int((p.next.Add(1) - 1) % uint64(len(p.res)))
-	for i := range p.res {
-		idx := (start + i) % len(p.res)
-		attempts[i].resolver = p.res[idx]
-		attempts[i].request = req.Copy()
+	// dns.Msg is mutable: Pack updates EDNS OPT state. buildAttempts copies the
+	// request before any worker starts and omits circuits still cooling down.
+	attempts := p.buildAttempts(req)
+	if len(attempts) == 0 {
+		return nil, fmt.Errorf("group resolver %s: %w", p.name, ErrNoAvailableUpstream)
 	}
 
 	logger := logutil.GetLogger(ctx).With(zap.String("resolver", p.name), zap.Int("parallel", p.concurrent))

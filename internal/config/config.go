@@ -131,7 +131,7 @@ func (c *Config) applyDefaults() {
 		c.Server.MaxResponseUDPSize = 1232
 	}
 	if c.Server.MaxInflight == 0 {
-		c.Server.MaxInflight = 1024
+		c.Server.MaxInflight = 256
 	}
 	if c.Server.RequestTimeout == 0 {
 		c.Server.RequestTimeout = 10

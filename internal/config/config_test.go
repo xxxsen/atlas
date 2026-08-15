@@ -33,7 +33,7 @@ func TestLoadAppliesSafeDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Bind != "127.0.0.1:5353" || cfg.Server.UDPSize != 4096 || cfg.Server.MaxResponseUDPSize != 1232 {
+	if cfg.Bind != "127.0.0.1:5353" || cfg.Server.UDPSize != 4096 || cfg.Server.MaxResponseUDPSize != 1232 || cfg.Server.MaxInflight != 256 || cfg.Server.RequestTimeout != 10 {
 		t.Fatalf("unexpected server defaults: %+v", cfg.Server)
 	}
 	if cfg.Cache.Size != 0 {

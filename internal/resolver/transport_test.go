@@ -227,7 +227,8 @@ func TestResolverURLValidationAndDoHQueryPreservation(t *testing.T) {
 		t.Fatal(err)
 	}
 	limited := item.(*limitedResolver)
-	doh := limited.next.(*dohResolver)
+	circuit := limited.next.(*circuitBreakerResolver)
+	doh := circuit.next.(*dohResolver)
 	endpoint, err := url.Parse(doh.endpoint)
 	if err != nil {
 		t.Fatal(err)
@@ -235,13 +236,29 @@ func TestResolverURLValidationAndDoHQueryPreservation(t *testing.T) {
 	if endpoint.RawQuery != "token=%2fexact+value&route=b" || endpoint.Query().Get("token") != "/exact value" || endpoint.Query().Has("timeout") || endpoint.Query().Has("max_conns") || endpoint.Query().Has("max_inflight") {
 		t.Fatalf("unexpected DoH endpoint query: %s", endpoint.RawQuery)
 	}
-	if doh.transport.MaxConnsPerHost != 7 || doh.transport.MaxIdleConnsPerHost != 7 || !doh.transport.ForceAttemptHTTP2 {
-		t.Fatalf("unexpected DoH transport bounds: %+v", doh.transport)
+	transport := doh.state.Load().transport
+	if transport.MaxConnsPerHost != 7 || transport.MaxIdleConnsPerHost != 7 || !transport.ForceAttemptHTTP2 {
+		t.Fatalf("unexpected DoH transport bounds: %+v", transport)
+	}
+	if transport.HTTP2 == nil || transport.HTTP2.SendPingTimeout != defaultDoHHTTP2SendPingTimeout || transport.HTTP2.PingTimeout != defaultDoHHTTP2PingTimeout {
+		t.Fatalf("unexpected DoH HTTP/2 health-check defaults: %+v", transport.HTTP2)
 	}
 	if cap(limited.slots) != 5 {
 		t.Fatalf("unexpected upstream in-flight limit: %d", cap(limited.slots))
 	}
 	_ = doh.Close()
+
+	defaultItem, err := MakeResolver("https://resolver.example/dns-query")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defaultLimited := defaultItem.(*limitedResolver)
+	defaultCircuit := defaultLimited.next.(*circuitBreakerResolver)
+	defaultDoH := defaultCircuit.next.(*dohResolver)
+	if cap(defaultLimited.slots) != defaultDoHMaxConnections || defaultDoH.timeout != defaultDoHRequestTimeout || defaultDoH.maxConnections != defaultDoHMaxConnections {
+		t.Fatalf("unexpected default DoH budgets: slots=%d timeout=%s connections=%d", cap(defaultLimited.slots), defaultDoH.timeout, defaultDoH.maxConnections)
+	}
+	_ = defaultItem.(ResolverCloser).Close()
 
 	for _, link := range []string{
 		"",
@@ -270,7 +287,7 @@ func TestResolverURLValidationAndDoHQueryPreservation(t *testing.T) {
 
 func TestDoHQuerySuccess(t *testing.T) {
 	var sawToken atomic.Bool
-	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		if request.URL.Query().Get("token") == "secret" {
 			sawToken.Store(true)
 		}
@@ -296,7 +313,7 @@ func TestDoHQuerySuccess(t *testing.T) {
 	}))
 	defer server.Close()
 
-	item := testDoHResolver(server, "?token=secret")
+	item := testDoHResolver(t, server, "?token=secret")
 	request := new(dns.Msg)
 	request.SetQuestion("doh.test.", dns.TypeA)
 	response, err := item.Query(context.Background(), request)
@@ -332,13 +349,12 @@ func TestDoHUsesHTTP2AndReusesConnection(t *testing.T) {
 	server.StartTLS()
 	defer server.Close()
 
-	item, err := newDoHResolver(server.URL, time.Second, 4)
+	tlsConfig := server.Client().Transport.(*http.Transport).TLSClientConfig
+	item, err := newDoHResolverWithTLSConfig(server.URL, time.Second, tlsConfig, 4)
 	if err != nil {
 		t.Fatal(err)
 	}
 	doh := item.(*dohResolver)
-	testTransport := server.Client().Transport.(*http.Transport)
-	doh.transport.TLSClientConfig = testTransport.TLSClientConfig.Clone()
 	t.Cleanup(func() { _ = doh.Close() })
 	for index := 0; index < 2; index++ {
 		request := new(dns.Msg)
@@ -384,9 +400,9 @@ func TestDoHRejectsInvalidResponses(t *testing.T) {
 	}
 	for name, handler := range tests {
 		t.Run(name, func(t *testing.T) {
-			server := httptest.NewServer(http.HandlerFunc(handler))
+			server := httptest.NewTLSServer(http.HandlerFunc(handler))
 			defer server.Close()
-			item := testDoHResolver(server, "")
+			item := testDoHResolver(t, server, "")
 			request := new(dns.Msg)
 			request.SetQuestion("doh-invalid.test.", dns.TypeA)
 			if _, err := item.Query(context.Background(), request); err == nil {
@@ -410,9 +426,16 @@ func dnsMutationHandler(mutate func(*dns.Msg, *dns.Msg)) func(http.ResponseWrite
 	}
 }
 
-func testDoHResolver(server *httptest.Server, suffix string) *dohResolver {
-	transport, _ := server.Client().Transport.(*http.Transport)
-	return &dohResolver{endpoint: server.URL + suffix, client: server.Client(), transport: transport}
+func testDoHResolver(t *testing.T, server *httptest.Server, suffix string) *dohResolver {
+	t.Helper()
+	tlsConfig := server.Client().Transport.(*http.Transport).TLSClientConfig
+	item, err := newDoHResolverWithTLSConfig(server.URL+suffix, time.Second, tlsConfig, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	doh := item.(*dohResolver)
+	t.Cleanup(func() { _ = doh.Close() })
+	return doh
 }
 
 func TestEnsurePort(t *testing.T) {

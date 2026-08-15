@@ -127,7 +127,10 @@ func MakeResolver(link string) (IDNSResolver, error) {
 	if item == nil {
 		return nil, fmt.Errorf("resolver factory %s returned nil", scheme)
 	}
-	return newLimitedResolver(item, resolverInflightLimit(scheme, urlinfo.CustomParams)), nil
+	// Limit admission before consulting the circuit breaker. Queries queued on
+	// the limiter therefore observe a newly opened circuit instead of forming a
+	// large backlog of already-authorized upstream attempts.
+	return newLimitedResolver(newCircuitBreakerResolver(item), resolverInflightLimit(scheme, urlinfo.CustomParams)), nil
 }
 
 var resolverLocalQueryKeys = map[string]struct{}{
@@ -265,4 +268,15 @@ func (r *limitedResolver) Close() error {
 	return r.closeErr
 }
 
+func (r *limitedResolver) resolverHealth() upstreamHealth {
+	if r.closed.Load() {
+		return upstreamHealth{}
+	}
+	if reporter, ok := r.next.(healthReportingResolver); ok {
+		return reporter.resolverHealth()
+	}
+	return upstreamHealth{Available: !r.closed.Load()}
+}
+
 var _ ResolverCloser = (*limitedResolver)(nil)
+var _ healthReportingResolver = (*limitedResolver)(nil)

@@ -59,7 +59,7 @@ func New(opts ...Option) (IDNSServer, error) {
 		bind:               "127.0.0.1:5353",
 		udpSize:            4096,
 		maxResponseUDPSize: 1232,
-		maxInflight:        1024,
+		maxInflight:        256,
 		requestTimeout:     10 * time.Second,
 		rateLimitClients:   4096,
 	}
