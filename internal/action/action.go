@@ -5,8 +5,10 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/miekg/dns"
+	"github.com/xxxsen/atlas/internal/ipset"
 	"github.com/xxxsen/atlas/internal/resolver"
 )
 
@@ -17,7 +19,9 @@ type IDNSAction interface {
 }
 
 type Dependencies struct {
-	Cache *resolver.CacheManager
+	Cache        *resolver.CacheManager
+	IPSets       *ipset.Registry
+	QueryTimeout time.Duration
 }
 
 type Factory func(name string, args interface{}, dependencies Dependencies) (IDNSAction, error)

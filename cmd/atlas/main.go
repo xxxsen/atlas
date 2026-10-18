@@ -17,6 +17,7 @@ import (
 	"github.com/xxxsen/atlas/internal/bootstrap"
 	"github.com/xxxsen/atlas/internal/config"
 	"github.com/xxxsen/atlas/internal/hosts"
+	"github.com/xxxsen/atlas/internal/ipset"
 	"github.com/xxxsen/atlas/internal/matcher"
 	_ "github.com/xxxsen/atlas/internal/matcher/register"
 	"github.com/xxxsen/atlas/internal/resolver"
@@ -79,6 +80,10 @@ func run(configPath string) (returnErr error) {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	ipSets, err := ipset.Load(cfg.Resource.IPSet)
+	if err != nil {
+		return fmt.Errorf("initialize IP sets: %w", err)
+	}
 
 	var cacheManager *resolver.CacheManager
 	cacheOptions, err := makeCacheOptions(cfg)
@@ -86,7 +91,9 @@ func run(configPath string) (returnErr error) {
 		return err
 	}
 	if cfg.Cache.Size > 0 {
-		cacheManager, err = resolver.NewCacheManager(ctx, cacheOptions)
+		ordinaryCacheOptions := cacheOptions
+		ordinaryCacheOptions.QueryTimeout = time.Duration(cfg.Server.RequestTimeout) * time.Second
+		cacheManager, err = resolver.NewCacheManager(ctx, ordinaryCacheOptions)
 		if err != nil {
 			return fmt.Errorf("initialize cache: %w", err)
 		}
@@ -106,7 +113,10 @@ func run(configPath string) (returnErr error) {
 	if err != nil {
 		return fmt.Errorf("build matcher map: %w", err)
 	}
-	as, err := buildActionMap(cfg.Resource.Action, action.Dependencies{Cache: cacheManager})
+	as, err := buildActionMap(cfg.Resource.Action, action.Dependencies{
+		Cache: cacheManager, IPSets: ipSets,
+		QueryTimeout: time.Duration(cfg.Server.RequestTimeout) * time.Second,
+	})
 	if err != nil {
 		return fmt.Errorf("build action map: %w", err)
 	}
@@ -197,13 +207,16 @@ func buildActionMap(ats []config.ActionConfig, dependencies ...action.Dependenci
 	m := make(map[string]action.IDNSAction, len(ats))
 	for _, at := range ats {
 		if _, exists := m[at.Name]; exists {
-			return nil, fmt.Errorf("duplicate action name %q", at.Name)
+			return nil, errors.Join(fmt.Errorf("duplicate action name %q", at.Name), closeActions(m))
 		}
 		inst, err := action.MakeAction(at.Type, at.Name, at.Data, dependencies...)
 		if err != nil {
 			return nil, errors.Join(fmt.Errorf("make action failed, name:%s, type:%s, err:%w", at.Name, at.Type, err), closeActions(m))
 		}
 		m[at.Name] = inst
+	}
+	if err := action.ResolveReferences(m); err != nil {
+		return nil, errors.Join(err, closeActions(m))
 	}
 	return m, nil
 }

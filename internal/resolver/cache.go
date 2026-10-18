@@ -309,6 +309,8 @@ func (c *CacheManager) Query(ctx context.Context, namespace string, resolver IDN
 	if c.isClosed() {
 		return nil, context.Canceled
 	}
+	ctx, cancel := WithQueryBudget(ctx, c.cfg.QueryTimeout)
+	defer cancel()
 	key, cacheable := buildCacheKey(namespace, req)
 	if !cacheable {
 		c.bypasses.Add(1)
@@ -326,7 +328,7 @@ func (c *CacheManager) Query(ctx context.Context, namespace string, resolver IDN
 			return prepareCachedResponse(msg, req), nil
 		}
 		c.staleHits.Add(1)
-		c.scheduleRefresh(key, resolver, req.Copy())
+		c.scheduleRefresh(ctx, key, resolver, req.Copy())
 		return prepareCachedResponse(msg, req), nil
 	}
 
@@ -382,7 +384,7 @@ func (c *CacheManager) queryFlight(ctx context.Context, key cacheKey, resolver I
 		flight = &cacheFlight{done: make(chan struct{})}
 		c.flights[key] = flight
 		request := req.Copy()
-		if !c.startTask(func() { c.runFlight(key, resolver, request, flight) }) {
+		if !c.startTask(func() { c.runFlight(ctx, key, resolver, request, flight) }) {
 			delete(c.flights, key)
 			flight.err = context.Canceled
 			close(flight.done)
@@ -401,8 +403,8 @@ func (c *CacheManager) queryFlight(ctx context.Context, key cacheKey, resolver I
 	}
 }
 
-func (c *CacheManager) runFlight(key cacheKey, resolver IDNSResolver, req *dns.Msg, flight *cacheFlight) {
-	queryCtx, cancel := context.WithTimeout(c.ctx, c.cfg.QueryTimeout)
+func (c *CacheManager) runFlight(source context.Context, key cacheKey, resolver IDNSResolver, req *dns.Msg, flight *cacheFlight) {
+	queryCtx, cancel := cacheQueryContext(c.ctx, source, c.cfg.QueryTimeout)
 	defer cancel()
 	msg, err := resolver.Query(queryCtx, req)
 	if err == nil {
@@ -421,7 +423,7 @@ func (c *CacheManager) runFlight(key cacheKey, resolver IDNSResolver, req *dns.M
 	c.flightMu.Unlock()
 }
 
-func (c *CacheManager) scheduleRefresh(key cacheKey, resolver IDNSResolver, req *dns.Msg) {
+func (c *CacheManager) scheduleRefresh(source context.Context, key cacheKey, resolver IDNSResolver, req *dns.Msg) {
 	c.refreshMu.Lock()
 	if _, exists := c.refreshing[key]; exists {
 		c.refreshMu.Unlock()
@@ -444,7 +446,7 @@ func (c *CacheManager) scheduleRefresh(key cacheKey, resolver IDNSResolver, req 
 			c.refreshMu.Unlock()
 		}()
 		c.refreshes.Add(1)
-		ctx, cancel := context.WithTimeout(c.ctx, c.cfg.QueryTimeout)
+		ctx, cancel := cacheQueryContext(c.ctx, source, c.cfg.QueryTimeout)
 		defer cancel()
 		msg, err := resolver.Query(ctx, req)
 		if err == nil {

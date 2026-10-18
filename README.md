@@ -1,6 +1,6 @@
 # Atlas DNS 转发器
 
-Atlas 是一个由 matcher、rule 和 action 组合驱动的 DNS 转发服务。它支持 UDP/TCP、DNS over TLS、DNS over HTTPS、静态 hosts、geosite 分流、策略级缓存、有界的并发故障转移，以及通过签名 TXT 保护代理入口的 bootstrap 解析。
+Atlas 是一个由 matcher、rule 和 action 组合驱动的 DNS 转发服务。它支持 UDP/TCP、DNS over TLS、DNS over HTTPS、静态 hosts、geosite 分流、策略级缓存、响应地址校验与回退，以及通过签名 TXT 保护代理入口的 bootstrap 解析。
 
 默认配置行为偏向安全：DNS 监听地址为 `127.0.0.1:5353`，pprof 为 `127.0.0.1:6060`。如需对外提供递归解析，必须显式修改监听地址，并配合网络 ACL、防火墙和客户端限速。
 
@@ -132,6 +132,62 @@ log:
   level: info
   console: true
 ```
+
+## 转发响应地址校验与 fallback
+
+对于使用国内 DoH 的 forward action，可以允许指定 IP 规则集及内网地址；响应中出现未允许的地址时，丢弃整份响应，直接调用另一个 forward action。下面的配置补充到前面的示例中，域名仍由原有 matcher/rule 分流：
+
+```yaml
+resource:
+  ip_set:
+    - name: cn
+      files:
+        - /data/ip-rules/cn-v4.txt
+        - /data/ip-rules/cn-v6.txt
+
+  action:
+    - name: forward-local
+      type: forward
+      data:
+        server_list:
+          - https://223.5.5.5/dns-query?timeout=1500
+          - https://1.12.12.12/dns-query?timeout=1500
+        parallel: 2
+        validate:
+          ip_sets: [cn]
+          networks: [private, loopback, link_local, shared]
+        fallback: forward-remote
+
+    - name: forward-remote
+      type: forward
+      data:
+        server_list:
+          - https://1.1.1.1/dns-query?timeout=2500
+        parallel: 1
+```
+
+`resource.ip_set` 是具名本地 CIDR 集合，文件一行一个 IPv4/IPv6 CIDR，支持空行和 `#` 注释，包括行尾注释。网段会规范化、去重；文件在启动时加载，修改后重启生效。Atlas 不自动下载、更新或按国家查询这些文件。读取失败、非法 CIDR、重复名称、未定义集合和未知网络类型均阻止启动，并报告对应位置。一个集合最多包含 100 万个不同 CIDR，单行最多 4096 字节。
+
+`networks` 可选值如下，其他特殊地址可自行放入 IP 集合：
+
+| 名称 | IPv4 | IPv6 |
+| --- | --- | --- |
+| `private` | `10.0.0.0/8`、`172.16.0.0/12`、`192.168.0.0/16` | `fc00::/7` |
+| `loopback` | `127.0.0.0/8` | `::1/128` |
+| `link_local` | `169.254.0.0/16` | `fe80::/10` |
+| `shared` | `100.64.0.0/10` | 无 |
+
+每个地址匹配任一集合或网络即可通过，但响应中所有被检查的地址都必须通过。IPv4-mapped IPv6 地址按 IPv4 判断。只检查 Answer 中的 A、AAAA，以及 HTTPS/SVCB 的 `ipv4hint`、`ipv6hint`；不检查 Authority/Additional。NXDOMAIN、NODATA、纯 CNAME、没有地址提示的 HTTPS/SVCB 等结果继续接受。
+
+`validate` 和 `fallback` 必须同时配置，且至少配置一个集合引用或一个网络名称。`ip_sets` 可省略或为空；引用空集合也有效，只是该集合不允许任何地址。`fallback` 按名称引用已定义的 forward action，与配置顺序无关；多个 action 可共享同一目标，也支持无环的多级回退。未定义目标、指向非 forward action、自引用及循环引用均阻止启动。
+
+上游组仍采用第一个有效 DNS 响应。该结果校验失败后立即转入 fallback，不再尝试同组其他节点，也不拼接两边的记录。只有地址校验失败触发此回退；普通超时、SERVFAIL 等继续沿用上游组原有的错误处理。fallback 直接执行目标 action，不重新匹配域名规则；目标按自己的策略处理，其最终响应不会被来源 action 的地址规则再次拒绝。完整查询及后台刷新各自共用 `server.request_timeout` 的总预算，多级回退不会逐级重置超时。
+
+缓存位于完整策略之外。fallback 成功的结果同时进入来源 action 和目标 action 的缓存，共享现有总容量限制。乐观缓存仍可立即返回 TTL 0 的旧数据，后台刷新执行完整的校验和回退流程；刷新失败不覆盖旧数据，也不延长 `max_stale`。没有可用缓存且最终查询失败时返回 SERVFAIL。hosts 和签名 bootstrap 继续由各自的解析流程处理。
+
+新增或修改 IP 集合、`validate`、`fallback` 不自动使已有内存或落盘缓存失效，也不重新验证缓存命中结果。若希望新策略立即影响已有缓存，应先停止服务、删除 `cache.file` 指定的普通 DNS 缓存文件，再启动服务；运行时直接删除文件可能被再次落盘覆盖。其他配置变更仍沿用原有指纹检查，无需为本功能删除 bootstrap 检查点。
+
+这一机制按允许的地址范围筛查结果。正常 CDN 也可能返回境外地址并触发 fallback；日志中的校验失败不代表已证实遭到攻击，规则集遗漏的合法网段也需要自行补充。
 
 ## 签名 TXT bootstrap
 
