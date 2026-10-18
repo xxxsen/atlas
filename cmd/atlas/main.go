@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"errors"
-	"flag"
 	"fmt"
 	"log"
 	"os"
@@ -12,8 +11,10 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/spf13/cobra"
 	"github.com/xxxsen/atlas/internal/action"
 	_ "github.com/xxxsen/atlas/internal/action/register"
+	"github.com/xxxsen/atlas/internal/bootstrap"
 	"github.com/xxxsen/atlas/internal/config"
 	"github.com/xxxsen/atlas/internal/hosts"
 	"github.com/xxxsen/atlas/internal/matcher"
@@ -33,17 +34,34 @@ var (
 )
 
 func main() {
-	cfgPath := flag.String("config", "", "path to YAML configuration file")
-	showVersion := flag.Bool("version", false, "print version information and exit")
-	flag.Parse()
-	if *showVersion {
-		fmt.Printf("atlas %s (commit %s, built %s)\n", version, commit, buildDate)
-		return
-	}
-	if err := run(*cfgPath); err != nil {
+	if err := newRootCommand(time.Now).Execute(); err != nil {
 		log.Printf("atlas stopped with error: %v", err)
 		os.Exit(1)
 	}
+}
+
+func newRootCommand(now func() time.Time) *cobra.Command {
+	var configPath string
+	var showVersion bool
+	cmd := &cobra.Command{
+		Use:           "atlas",
+		Short:         "DNS forwarder with verified bootstrap resolution",
+		Args:          cobra.NoArgs,
+		SilenceUsage:  true,
+		SilenceErrors: true,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			if showVersion {
+				_, err := fmt.Fprintf(cmd.OutOrStdout(), "atlas %s (commit %s, built %s)\n", version, commit, buildDate)
+				return err
+			}
+			return run(configPath)
+		},
+	}
+	cmd.CompletionOptions.DisableDefaultCmd = true
+	cmd.Flags().StringVar(&configPath, "config", "", "path to YAML configuration file")
+	cmd.Flags().BoolVar(&showVersion, "version", false, "print version information and exit")
+	cmd.AddCommand(newBootstrapCommand(now))
+	return cmd
 }
 
 func run(configPath string) (returnErr error) {
@@ -63,24 +81,12 @@ func run(configPath string) (returnErr error) {
 	defer stop()
 
 	var cacheManager *resolver.CacheManager
+	cacheOptions, err := makeCacheOptions(cfg)
+	if err != nil {
+		return err
+	}
 	if cfg.Cache.Size > 0 {
-		fingerprint, err := cfg.Fingerprint()
-		if err != nil {
-			return err
-		}
-		cacheManager, err = resolver.NewCacheManager(ctx, resolver.CacheOptions{
-			Size:               cfg.Cache.Size,
-			MaxBytes:           cfg.Cache.MaxBytes,
-			MaxEntryBytes:      cfg.Cache.MaxEntryBytes,
-			Lazy:               cfg.Cache.Lazy,
-			MaxStale:           time.Duration(cfg.Cache.MaxStale) * time.Second,
-			Persist:            cfg.Cache.Persist,
-			File:               cfg.Cache.File,
-			Interval:           time.Duration(cfg.Cache.Interval) * time.Second,
-			RefreshConcurrency: cfg.Cache.RefreshConcurrency,
-			NegativeTTLMax:     time.Duration(cfg.Cache.NegativeTTLMax) * time.Second,
-			Fingerprint:        fingerprint,
-		})
+		cacheManager, err = resolver.NewCacheManager(ctx, cacheOptions)
 		if err != nil {
 			return fmt.Errorf("initialize cache: %w", err)
 		}
@@ -111,6 +117,18 @@ func run(configPath string) (returnErr error) {
 	if err != nil {
 		return fmt.Errorf("build host store: %w", err)
 	}
+	var bootstrapManager *bootstrap.Manager
+	if cfg.Bootstrap != nil {
+		bootstrapManager, err = bootstrap.New(ctx, *cfg.Bootstrap, bootstrap.Options{Cache: cacheOptions, Hosts: hosts})
+		if err != nil {
+			return fmt.Errorf("initialize bootstrap: %w", err)
+		}
+		defer func() {
+			closeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			returnErr = errors.Join(returnErr, bootstrapManager.Close(closeCtx))
+		}()
+	}
 	engine, err := buildRuleEngine(cfg.Rule, ms, as)
 	if err != nil {
 		return fmt.Errorf("build rule engine: %w", err)
@@ -126,6 +144,9 @@ func run(configPath string) (returnErr error) {
 		server.WithRequestTimeout(time.Duration(cfg.Server.RequestTimeout) * time.Second),
 		server.WithClientRateLimit(cfg.Server.RateLimitQPS, cfg.Server.RateLimitBurst, cfg.Server.RateLimitClients),
 		server.WithAllowedCIDRs(cfg.Server.AllowedCIDRs),
+	}
+	if bootstrapManager != nil {
+		serverOpts = append(serverOpts, server.WithBootstrapResolver(bootstrapManager))
 	}
 
 	forwarder, err := server.New(serverOpts...)
@@ -156,6 +177,20 @@ func run(configPath string) (returnErr error) {
 	}
 	logkit.Info("shutdown complete")
 	return nil
+}
+
+func makeCacheOptions(cfg *config.Config) (resolver.CacheOptions, error) {
+	fingerprint, err := cfg.Fingerprint()
+	if err != nil {
+		return resolver.CacheOptions{}, err
+	}
+	return resolver.CacheOptions{
+		Size: cfg.Cache.Size, MaxBytes: cfg.Cache.MaxBytes, MaxEntryBytes: cfg.Cache.MaxEntryBytes,
+		Lazy: cfg.Cache.Lazy, MaxStale: time.Duration(cfg.Cache.MaxStale) * time.Second,
+		Persist: cfg.Cache.Persist, File: cfg.Cache.File, Interval: time.Duration(cfg.Cache.Interval) * time.Second,
+		RefreshConcurrency: cfg.Cache.RefreshConcurrency, NegativeTTLMax: time.Duration(cfg.Cache.NegativeTTLMax) * time.Second,
+		Fingerprint: fingerprint,
+	}, nil
 }
 
 func buildActionMap(ats []config.ActionConfig, dependencies ...action.Dependencies) (map[string]action.IDNSAction, error) {

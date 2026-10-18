@@ -149,3 +149,52 @@ func TestDisabledCacheRejectsInertPersistenceFile(t *testing.T) {
 		t.Fatalf("expected disabled-cache options to fail, got %v", err)
 	}
 }
+
+const bootstrapConfig = `
+bootstrap:
+  server_list:
+    - https://223.5.5.5/dns-query
+    - https://1.12.12.12/dns-query
+  files:
+    - /config/bootstrap-domains.txt
+  public_keys:
+    - /config/bootstrap.pub
+`
+
+func TestBootstrapConfigDefaultsGlobalKeysAndPolicyFingerprint(t *testing.T) {
+	cfg, err := loadText(t, minimalConfig+bootstrapConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := cfg.Bootstrap
+	if b == nil || b.Parallel != 2 || b.RequestTimeout != 3 || b.TTLMax != 300 || b.ClockSkew == nil || *b.ClockSkew != 30 || len(b.Files) != 1 || len(b.PublicKeys) != 1 {
+		t.Fatalf("unexpected bootstrap defaults: %+v", b)
+	}
+	before, err := cfg.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	b.PublicKeys = append(b.PublicKeys, "/config/next.pub")
+	after, err := cfg.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before == after {
+		t.Fatal("bootstrap policy omitted from fingerprint")
+	}
+	cfg, err = loadText(t, minimalConfig+bootstrapConfig+"  clock_skew: 0\n")
+	if err != nil || *cfg.Bootstrap.ClockSkew != 0 {
+		t.Fatalf("explicit zero skew was lost: %v", err)
+	}
+}
+
+func TestBootstrapConfigRejectsOldRecordsAndInvalidBounds(t *testing.T) {
+	for _, addition := range []string{"  records: {}\n", "  parallel: 3\n", "  clock_skew: -1\n", "  ttl_max: -1\n", "  request_timeout: 301\n"} {
+		if _, err := loadText(t, minimalConfig+bootstrapConfig+addition); err == nil {
+			t.Errorf("accepted invalid bootstrap config: %s", addition)
+		}
+	}
+	if _, err := loadText(t, minimalConfig+"bootstrap: {}\n"); err == nil {
+		t.Fatal("accepted an empty bootstrap configuration")
+	}
+}

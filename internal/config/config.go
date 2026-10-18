@@ -15,19 +15,21 @@ import (
 	"strings"
 	"unicode"
 
+	"github.com/xxxsen/atlas/internal/bootstrap"
 	"github.com/xxxsen/common/logger"
 	"gopkg.in/yaml.v3"
 )
 
 // Config is the root runtime configuration.
 type Config struct {
-	Bind     string           `json:"bind" yaml:"bind"`
-	Server   ServerConfig     `json:"server" yaml:"server"`
-	Resource Resource         `json:"resource" yaml:"resource"`
-	Rule     []Rule           `json:"rule" yaml:"rule"`
-	Log      logger.LogConfig `json:"log" yaml:"log"`
-	Cache    CacheConfig      `json:"cache" yaml:"cache"`
-	Pprof    PprofConfig      `json:"pprof" yaml:"pprof"`
+	Bind      string            `json:"bind" yaml:"bind"`
+	Server    ServerConfig      `json:"server" yaml:"server"`
+	Resource  Resource          `json:"resource" yaml:"resource"`
+	Rule      []Rule            `json:"rule" yaml:"rule"`
+	Log       logger.LogConfig  `json:"log" yaml:"log"`
+	Cache     CacheConfig       `json:"cache" yaml:"cache"`
+	Pprof     PprofConfig       `json:"pprof" yaml:"pprof"`
+	Bootstrap *bootstrap.Config `json:"bootstrap,omitempty" yaml:"bootstrap"`
 }
 
 type CacheConfig struct {
@@ -120,6 +122,9 @@ func Load(path string) (*Config, error) {
 }
 
 func (c *Config) applyDefaults() {
+	if c.Bootstrap != nil {
+		c.Bootstrap.ApplyDefaults()
+	}
 	c.Bind = strings.TrimSpace(c.Bind)
 	if strings.TrimSpace(c.Bind) == "" {
 		c.Bind = "127.0.0.1:5353"
@@ -192,6 +197,11 @@ func defaultCacheBytes(entries int64) int64 {
 
 func (c *Config) Validate() error {
 	var errs []error
+	if c.Bootstrap != nil {
+		if err := c.Bootstrap.Validate(); err != nil {
+			errs = append(errs, err)
+		}
+	}
 	if err := validateAddress("bind", c.Bind); err != nil {
 		errs = append(errs, err)
 	}
@@ -374,10 +384,11 @@ func errorsJoin(errs []error) error {
 
 func (c *Config) Fingerprint() (string, error) {
 	data, err := json.Marshal(struct {
-		Resource Resource    `json:"resource"`
-		Rule     []Rule      `json:"rule"`
-		Cache    CacheConfig `json:"cache"`
-	}{Resource: c.Resource, Rule: c.Rule, Cache: c.Cache})
+		Resource  Resource          `json:"resource"`
+		Rule      []Rule            `json:"rule"`
+		Cache     CacheConfig       `json:"cache"`
+		Bootstrap *bootstrap.Config `json:"bootstrap,omitempty"`
+	}{Resource: c.Resource, Rule: c.Rule, Cache: c.Cache, Bootstrap: c.Bootstrap})
 	if err != nil {
 		return "", fmt.Errorf("encode configuration fingerprint: %w", err)
 	}

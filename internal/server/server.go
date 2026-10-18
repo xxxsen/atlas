@@ -396,6 +396,12 @@ func summariseIPs(msg *dns.Msg) string {
 }
 
 func (s *dnsServer) processRequest(ctx context.Context, req *dns.Msg) (*dns.Msg, error) {
+	if s.c.bootstrap != nil {
+		response, handled, err := s.c.bootstrap.Resolve(ctx, req)
+		if handled || err != nil {
+			return response, err
+		}
+	}
 	if response, ok := s.tryHosts(ctx, req); ok {
 		return response, nil
 	}
