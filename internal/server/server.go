@@ -41,7 +41,6 @@ type dnsServer struct {
 	c              *options
 	udpServer      *dns.Server
 	tcpServer      *dns.Server
-	tid            atomic.Uint64
 	started        atomic.Bool
 	inflight       chan struct{}
 	limiter        *clientRateLimiter
@@ -222,10 +221,9 @@ func (s *dnsServer) handleDNS(parent context.Context, w dns.ResponseWriter, req 
 		_ = writeRcode(w, req, dns.RcodeServerFailure)
 		return
 	}
-	tid := s.tid.Add(1)
 	ctx, cancel := context.WithTimeout(parent, s.c.requestTimeout)
 	defer cancel()
-	ctx = trace.WithTraceId(ctx, strconv.FormatUint(tid, 10))
+	ctx = trace.WithTraceId(ctx, querylog.NewID())
 	logger := logutil.GetLogger(ctx)
 	if req == nil {
 		logger.Error("received nil DNS request")

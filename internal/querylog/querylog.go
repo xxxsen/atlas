@@ -4,12 +4,11 @@ package querylog
 
 import (
 	"context"
+	"crypto/rand"
 	"net/url"
 	"regexp"
-	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/miekg/dns"
@@ -52,9 +51,9 @@ type state struct {
 type stateKey struct{}
 type loggerKey struct{}
 
-var sequence atomic.Uint64
-
-func NewID() string { return "work-" + strconv.FormatUint(sequence.Add(1), 10) }
+// NewID returns a random alphanumeric ID for requests and detached work.
+// IDs do not depend on process-local counters that reset after a restart.
+func NewID() string { return rand.Text() }
 
 // WithLogger provides a logger for this query and its detached work. It also
 // allows log assertions without replacing the process-wide logger in tests.
