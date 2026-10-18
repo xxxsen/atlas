@@ -351,7 +351,6 @@ func (c *CacheManager) Query(ctx context.Context, namespace string, resolver IDN
 		return prepareCachedResponse(msg, req), nil
 	}
 
-	c.misses.Add(1)
 	querylog.SetCache(ctx, namespace, "miss")
 	return c.queryFlight(ctx, key, resolver, req)
 }
@@ -402,6 +401,21 @@ func (c *CacheManager) queryFlight(ctx context.Context, key cacheKey, resolver I
 	c.flightMu.Lock()
 	flight, ok := c.flights[key]
 	if !ok {
+		// A previous flight may have stored its response and left the map
+		// since the first cache lookup. Recheck before starting new work.
+		if msg, state, found, result := c.get(key); found && state == cacheFresh {
+			c.flightMu.Unlock()
+			if result.Source == "" {
+				result = querylog.Result{Source: "cache", Resolver: "unknown", Action: key.Namespace}
+			}
+			querylog.SetResult(ctx, result)
+			querylog.SetCache(ctx, key.Namespace, "fresh")
+			c.hits.Add(1)
+			if checked := querylog.Logger(ctx).Check(zap.DebugLevel, "DNS cache hit"); checked != nil {
+				checked.Write(append(querylog.Fields(ctx), zap.String("reason", "filled_while_waiting"))...)
+			}
+			return prepareCachedResponse(msg, req), nil
+		}
 		flight = &cacheFlight{done: make(chan struct{}), id: querylog.NewID()}
 		c.flights[key] = flight
 		request := req.Copy()
@@ -411,6 +425,7 @@ func (c *CacheManager) queryFlight(ctx context.Context, key cacheKey, resolver I
 			close(flight.done)
 		}
 	}
+	c.misses.Add(1)
 	c.flightMu.Unlock()
 	querylog.SetWork(ctx, flight.id)
 	start := time.Now()

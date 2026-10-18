@@ -130,3 +130,38 @@ func TestFailedBackgroundRefreshRetainsParentAndFailureContext(t *testing.T) {
 		t.Fatalf("lost background failure context: %+v", fields)
 	}
 }
+
+func TestCacheRechecksCompletedFlightBeforeStartingUpstream(t *testing.T) {
+	manager := newTestCache(t, nil)
+	req := newRequest()
+	ctx := querylog.WithQuery(context.Background(), req)
+	key, _ := buildCacheKey("local", req)
+	if _, _, found, _ := manager.get(key); found {
+		t.Fatal("expected initial cache miss")
+	}
+	querylog.SetCache(ctx, "local", "miss")
+	// Simulate the previous flight finishing after this client's first lookup
+	// but before it acquires the shared-flight lock.
+	msg := newResponse(60)
+	msg.Question = req.Question
+	msg.Id = req.Id + 1
+	origin := querylog.Result{Source: "upstream", Resolver: "remote-upstream", Action: "remote", ViaFallback: true}
+	if !manager.store(key, msg, origin) {
+		t.Fatal("could not seed completed response")
+	}
+	base := &mockResolver{msg: newResponse(60)}
+	response, err := manager.queryFlight(ctx, key, base, req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if base.count.Load() != 0 || response.Id != req.Id {
+		t.Fatalf("completed flight was queried again or response ID lost: calls=%d response=%v", base.count.Load(), response)
+	}
+	info := querylog.Read(ctx)
+	if info.Result != origin || info.CacheStatus != "fresh" || info.FallbackExecuted || info.WorkID != "" {
+		t.Fatalf("rechecked cache hit lost provenance or invented work: %+v", info)
+	}
+	if stats := manager.Stats(); stats.Hits != 1 || stats.Misses != 0 {
+		t.Fatalf("rechecked cache hit counted as upstream work: %+v", stats)
+	}
+}
