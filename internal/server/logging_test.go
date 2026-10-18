@@ -7,7 +7,6 @@ import (
 
 	"github.com/miekg/dns"
 	"github.com/xxxsen/atlas/internal/querylog"
-	"github.com/xxxsen/common/trace"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 	"go.uber.org/zap/zaptest/observer"
@@ -17,11 +16,15 @@ func TestSlowQuerySummaryIsVisibleWithoutDebugLogging(t *testing.T) {
 	core, logs := observer.New(zapcore.InfoLevel)
 	req := new(dns.Msg)
 	req.SetQuestion("slow.test.", dns.TypeA)
-	ctx := querylog.WithQuery(querylog.WithLogger(trace.WithTraceId(context.Background(), "slow-client"), zap.New(core)), req)
+	ctx := querylog.WithQuery(querylog.WithLogger(context.Background(), zap.New(core)), req)
+	ctx, span := querylog.Start(ctx, "dns.query")
+	defer querylog.Finish(ctx, span, nil)
 	querylog.SetResult(ctx, querylog.Result{Source: "upstream", Resolver: "foreign", Action: "remote", ViaFallback: true})
 	querylog.Apply(ctx, querylog.Read(ctx).Result, true)
 	querylog.SetCache(ctx, "local", "miss")
-	querylog.SetWork(ctx, "shared-work")
+	workCtx, workSpan := querylog.Fork(context.Background(), ctx, "cache.upstream", false)
+	defer querylog.Finish(workCtx, workSpan, nil)
+	querylog.SetWork(ctx, workSpan.SpanContext())
 	msg := new(dns.Msg)
 	msg.SetReply(req)
 	logHandledRequest(ctx, msg, 5*time.Millisecond, time.Millisecond)
@@ -34,7 +37,7 @@ func TestSlowQuerySummaryIsVisibleWithoutDebugLogging(t *testing.T) {
 		t.Fatalf("missing slow query warning: %+v", entries)
 	}
 	fields := entries[0].ContextMap()
-	if fields["traceid"] != "slow-client" || fields["result_resolver"] != "foreign" || fields["fallback_executed"] != true || fields["cache_status"] != "miss" || fields["upstream_traceid"] != "shared-work" || fields["proc_ms"] != float64(1500) {
+	if fields["trace_id"] != querylog.ID(ctx) || fields["span_id"] != span.SpanContext().SpanID().String() || fields["result_resolver"] != "foreign" || fields["fallback_executed"] != true || fields["cache_status"] != "miss" || fields["work_trace_id"] != querylog.ID(workCtx) || fields["work_span_id"] != workSpan.SpanContext().SpanID().String() || fields["proc_ms"] != float64(1500) {
 		t.Fatalf("insufficient slow query diagnostics: %+v", fields)
 	}
 }

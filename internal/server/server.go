@@ -16,8 +16,8 @@ import (
 	"github.com/xxxsen/atlas/internal/matcher"
 	"github.com/xxxsen/atlas/internal/querylog"
 	"github.com/xxxsen/atlas/internal/resolver"
-	"github.com/xxxsen/common/logutil"
-	"github.com/xxxsen/common/trace"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
 )
 
@@ -192,10 +192,19 @@ func (s *dnsServer) shutdown(parent context.Context, cause error) error {
 func (s *dnsServer) handleDNS(parent context.Context, w dns.ResponseWriter, req *dns.Msg) {
 	s.requests.Add(1)
 	wrote := false
+	ctx := parent
+	var span trace.Span
+	var queryErr error
 	defer func() {
+		defer func() {
+			if span != nil {
+				querylog.Finish(ctx, span, queryErr)
+			}
+		}()
 		if recovered := recover(); recovered != nil {
 			s.panics.Add(1)
-			logger := logutil.GetLogger(parent)
+			queryErr = fmt.Errorf("panic while handling DNS request: %v", recovered)
+			logger := querylog.Logger(ctx)
 			logger.Error("panic while handling DNS request", zap.Any("panic", recovered), zap.Stack("stack"))
 			if !wrote && req != nil {
 				_ = writeRcode(w, req, dns.RcodeServerFailure)
@@ -223,9 +232,11 @@ func (s *dnsServer) handleDNS(parent context.Context, w dns.ResponseWriter, req 
 	}
 	ctx, cancel := context.WithTimeout(parent, s.c.requestTimeout)
 	defer cancel()
-	ctx = trace.WithTraceId(ctx, querylog.NewID())
-	logger := logutil.GetLogger(ctx)
+	ctx = querylog.WithQuery(ctx, req)
+	ctx, span = querylog.Start(ctx, "dns.query", trace.WithNewRoot(), trace.WithSpanKind(trace.SpanKindServer))
+	logger := querylog.Logger(ctx)
 	if req == nil {
+		queryErr = fmt.Errorf("received nil DNS request")
 		logger.Error("received nil DNS request")
 		return
 	}
@@ -242,7 +253,6 @@ func (s *dnsServer) handleDNS(parent context.Context, w dns.ResponseWriter, req 
 		return
 	}
 	ctx = matcher.WithRequestMeta(ctx, req)
-	ctx = querylog.WithQuery(ctx, req)
 	logger = querylog.Logger(ctx)
 	start := time.Now()
 	resp, err := s.processRequest(ctx, req)
@@ -253,6 +263,7 @@ func (s *dnsServer) handleDNS(parent context.Context, w dns.ResponseWriter, req 
 		err = resolver.ValidateResponse(req, resp)
 	}
 	if err != nil {
+		queryErr = err
 		s.pipelineErrors.Add(1)
 		logger.Error("process DNS request failed", append(querylog.Fields(ctx), querylog.Error(err))...)
 		resp = new(dns.Msg)
@@ -261,8 +272,10 @@ func (s *dnsServer) handleDNS(parent context.Context, w dns.ResponseWriter, req 
 	if isUDPWriter(w) {
 		resp.Truncate(s.responseUDPSize(req))
 	}
+	span.SetAttributes(attribute.Int("dns.response_code", resp.Rcode))
 	writeStart := time.Now()
 	if err := w.WriteMsg(resp); err != nil {
+		queryErr = err
 		logger.Error("write DNS response failed", zap.Error(err))
 		return
 	}

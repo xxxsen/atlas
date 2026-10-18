@@ -20,10 +20,12 @@ import (
 	"github.com/xxxsen/atlas/internal/ipset"
 	"github.com/xxxsen/atlas/internal/matcher"
 	_ "github.com/xxxsen/atlas/internal/matcher/register"
+	"github.com/xxxsen/atlas/internal/querylog"
 	"github.com/xxxsen/atlas/internal/resolver"
 	"github.com/xxxsen/atlas/internal/rule"
 	"github.com/xxxsen/atlas/internal/server"
 	"github.com/xxxsen/common/logger"
+	"go.opentelemetry.io/otel"
 	"go.uber.org/zap"
 	"golang.org/x/sync/errgroup"
 )
@@ -80,6 +82,26 @@ func run(configPath string) (returnErr error) {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	ctx, traceProvider, err := querylog.ConfigureTracing(ctx, version)
+	if err != nil {
+		return fmt.Errorf("initialize tracing: %s", querylog.SafeText(err.Error()))
+	}
+	otel.SetTracerProvider(traceProvider)
+	otel.SetErrorHandler(otel.ErrorHandlerFunc(func(err error) {
+		logkit.Warn("OpenTelemetry export failed", querylog.Error(err))
+	}))
+	defer func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := traceProvider.Shutdown(shutdownCtx); err != nil {
+			logkit.Warn("OpenTelemetry shutdown failed", querylog.Error(err))
+		}
+	}()
+	exporter := strings.ToLower(strings.TrimSpace(os.Getenv("OTEL_TRACES_EXPORTER")))
+	if exporter == "" {
+		exporter = "none"
+	}
+	logkit.Info("initialized OpenTelemetry tracing", zap.String("exporter", exporter))
 	ipSets, err := ipset.Load(cfg.Resource.IPSet)
 	if err != nil {
 		return fmt.Errorf("initialize IP sets: %w", err)

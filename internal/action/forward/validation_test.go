@@ -18,7 +18,9 @@ import (
 	"github.com/xxxsen/atlas/internal/querylog"
 	"github.com/xxxsen/atlas/internal/resolver"
 	"github.com/xxxsen/atlas/internal/resolver/model"
-	"github.com/xxxsen/common/trace"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 	"go.uber.org/zap/zaptest/observer"
@@ -528,13 +530,22 @@ func TestFallbackLogsCostsSourceAndSeparatesCachedProvenance(t *testing.T) {
 		t.Fatal(err)
 	}
 	core, logs := observer.New(zapcore.DebugLevel)
+	recorder := tracetest.NewSpanRecorder()
+	provider := sdktrace.NewTracerProvider(sdktrace.WithSampler(sdktrace.AlwaysSample()), sdktrace.WithSpanProcessor(recorder))
+	t.Cleanup(func() { _ = provider.Shutdown(context.Background()) })
+	var firstWork trace.SpanContext
 	for _, id := range []string{"first-client", "second-client"} {
 		req := policyRequest()
-		ctx := querylog.WithQuery(querylog.WithLogger(trace.WithTraceId(context.Background(), id), zap.New(core)), req)
+		ctx := querylog.WithQuery(querylog.WithLogger(querylog.WithTracerProvider(context.Background(), provider), zap.New(core)), req)
+		ctx, span := querylog.Start(ctx, "dns.query")
 		if _, err := cn.Perform(ctx, req); err != nil {
 			t.Fatal(err)
 		}
+		querylog.Finish(ctx, span, nil)
 		snapshot := querylog.Read(ctx)
+		if id == "first-client" {
+			firstWork = snapshot.Work
+		}
 		if snapshot.Result.Resolver != "foreign-upstream" || snapshot.Result.Action != "remote" || !snapshot.Result.ViaFallback {
 			t.Fatalf("lost original response provenance: %+v", snapshot)
 		}
@@ -547,11 +558,31 @@ func TestFallbackLogsCostsSourceAndSeparatesCachedProvenance(t *testing.T) {
 	if len(trigger) != 1 || len(finished) != 1 {
 		t.Fatalf("unexpected fallback events: %d %d", len(trigger), len(finished))
 	}
-	if fields := trigger[0].ContextMap(); fields["primary_resolver"] != "domestic-upstream" || fields["rejected_ip"] != "1.1.1.1" || fields["parent_traceid"] != "first-client" {
+	if fields := trigger[0].ContextMap(); fields["primary_resolver"] != "domestic-upstream" || fields["rejected_ip"] != "1.1.1.1" || fields["trace_id"] != firstWork.TraceID().String() || fields["span_id"] == nil || fields["parent_traceid"] != nil {
 		t.Fatalf("missing fallback trigger context: %+v", fields)
 	}
 	fields := finished[0].ContextMap()
 	if finished[0].Level != zapcore.InfoLevel || fields["result_resolver"] != "foreign-upstream" || fields["elapsed_ms"] == nil || fields["primary_elapsed_ms"] == nil || fields["fallback_elapsed_ms"] == nil {
 		t.Fatalf("missing fallback timing/source: %+v", fields)
+	}
+	if err := cache.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	fallbacks, rejectedEvents := 0, 0
+	for _, span := range recorder.Ended() {
+		if span.Name() == "forward.fallback" {
+			fallbacks++
+			if span.Parent().SpanID() != firstWork.SpanID() || span.SpanContext().TraceID() != firstWork.TraceID() || span.SpanContext().SpanID().String() != fields["span_id"] {
+				t.Fatal("fallback span has the wrong parent or log context")
+			}
+		}
+		for _, event := range span.Events() {
+			if event.Name == "forward.validation.failed" {
+				rejectedEvents++
+			}
+		}
+	}
+	if fallbacks != 1 || rejectedEvents != 1 || len(recorder.Started()) != len(recorder.Ended()) {
+		t.Fatalf("fallback/cache trace mismatch or unfinished spans: fallbacks=%d rejected=%d started=%d ended=%d", fallbacks, rejectedEvents, len(recorder.Started()), len(recorder.Ended()))
 	}
 }

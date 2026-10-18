@@ -8,12 +8,17 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/miekg/dns"
 	"github.com/xxxsen/atlas/internal/querylog"
-	"github.com/xxxsen/common/trace"
+	"go.opentelemetry.io/otel/codes"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 	"go.uber.org/zap/zaptest/observer"
@@ -103,7 +108,7 @@ func TestCachePersistsProvenanceAndLoadsLegacyEntries(t *testing.T) {
 	}
 }
 
-func TestFailedBackgroundRefreshRetainsParentAndFailureContext(t *testing.T) {
+func TestFailedBackgroundRefreshRetainsTraceLinkAndFailureContext(t *testing.T) {
 	manager := newTestCache(t, func(cfg *CacheOptions) { cfg.Lazy, cfg.MaxStale = true, time.Minute })
 	req := newRequest()
 	key, _ := buildCacheKey("local", req)
@@ -116,8 +121,13 @@ func TestFailedBackgroundRefreshRetainsParentAndFailureContext(t *testing.T) {
 	entry.expire = time.Now().Add(-time.Second)
 	shard.mu.Unlock()
 	core, logs := observer.New(zapcore.DebugLevel)
+	recorder := tracetest.NewSpanRecorder()
+	provider := sdktrace.NewTracerProvider(sdktrace.WithSampler(sdktrace.AlwaysSample()), sdktrace.WithSpanProcessor(recorder))
+	t.Cleanup(func() { _ = provider.Shutdown(context.Background()) })
 	ctx, cancel := context.WithCancel(context.Background())
-	ctx = querylog.WithQuery(querylog.WithLogger(trace.WithTraceId(ctx, "stale-client"), zap.New(core)), req)
+	ctx = querylog.WithQuery(querylog.WithLogger(querylog.WithTracerProvider(ctx, provider), zap.New(core)), req)
+	ctx, clientSpan := querylog.Start(ctx, "dns.query")
+	defer querylog.Finish(ctx, clientSpan, nil)
 	fail := budgetQuery(func(context.Context, *dns.Msg) (*dns.Msg, error) { return nil, errors.New("fallback unavailable") })
 	response, err := manager.Query(ctx, "local", fail, req)
 	cancel()
@@ -126,9 +136,21 @@ func TestFailedBackgroundRefreshRetainsParentAndFailureContext(t *testing.T) {
 	}
 	waitFor(t, time.Second, func() bool { return logs.FilterMessage("DNS cache refresh failed").Len() == 1 }, "refresh failure log")
 	fields := logs.FilterMessage("DNS cache refresh failed").All()[0].ContextMap()
-	if fields["parent_traceid"] != "stale-client" || fields["background"] != true || fields["namespace"] != "local" || fields["domain"] != "example.com." || fields["elapsed_ms"] == nil || fields["error"] != "fallback unavailable" {
+	if fields["parent_traceid"] != nil || fields["trace_id"] == querylog.ID(ctx) || fields["span_id"] == nil || fields["background"] != true || fields["namespace"] != "local" || fields["domain"] != "example.com." || fields["elapsed_ms"] == nil || fields["error"] != "fallback unavailable" {
 		t.Fatalf("lost background failure context: %+v", fields)
 	}
+	if err := manager.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	for _, span := range recorder.Ended() {
+		if span.Name() == "cache.refresh" {
+			if span.Parent().IsValid() || len(span.Links()) != 1 || span.Links()[0].SpanContext.TraceID() != clientSpan.SpanContext().TraceID() || span.Status().Code != codes.Error || span.SpanContext().TraceID().String() != fields["trace_id"] {
+				t.Fatalf("incorrect refresh trace or failure: %+v", span)
+			}
+			return
+		}
+	}
+	t.Fatal("refresh span did not end")
 }
 
 func TestCacheRechecksCompletedFlightBeforeStartingUpstream(t *testing.T) {
@@ -158,10 +180,91 @@ func TestCacheRechecksCompletedFlightBeforeStartingUpstream(t *testing.T) {
 		t.Fatalf("completed flight was queried again or response ID lost: calls=%d response=%v", base.count.Load(), response)
 	}
 	info := querylog.Read(ctx)
-	if info.Result != origin || info.CacheStatus != "fresh" || info.FallbackExecuted || info.WorkID != "" {
+	if info.Result != origin || info.CacheStatus != "fresh" || info.FallbackExecuted || info.Work.IsValid() {
 		t.Fatalf("rechecked cache hit lost provenance or invented work: %+v", info)
 	}
 	if stats := manager.Stats(); stats.Hits != 1 || stats.Misses != 0 {
 		t.Fatalf("rechecked cache hit counted as upstream work: %+v", stats)
+	}
+}
+
+func TestSharedCacheWorkLinksAllWaitersAndSurvivesInitiatorCancellation(t *testing.T) {
+	manager := newTestCache(t, nil)
+	recorder := tracetest.NewSpanRecorder()
+	provider := sdktrace.NewTracerProvider(sdktrace.WithSampler(sdktrace.AlwaysSample()), sdktrace.WithSpanProcessor(recorder))
+	t.Cleanup(func() { _ = provider.Shutdown(context.Background()) })
+	core, logs := observer.New(zapcore.DebugLevel)
+	baseCtx := querylog.WithLogger(querylog.WithTracerProvider(context.Background(), provider), zap.New(core))
+	req := newRequest()
+	firstCtx, cancel := context.WithCancel(querylog.WithQuery(baseCtx, req))
+	firstCtx, first := querylog.Start(firstCtx, "dns.query")
+	defer querylog.Finish(firstCtx, first, nil)
+	defer cancel()
+	secondCtx := querylog.WithQuery(baseCtx, req)
+	secondCtx, second := querylog.Start(secondCtx, "dns.query")
+	defer querylog.Finish(secondCtx, second, nil)
+	started, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	defer once.Do(func() { close(release) })
+	var calls atomic.Int64
+	upstream := budgetQuery(func(ctx context.Context, req *dns.Msg) (*dns.Msg, error) {
+		if calls.Add(1) == 1 {
+			close(started)
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-release:
+		}
+		querylog.SetResult(ctx, querylog.Result{Source: "upstream", Resolver: "shared-upstream", Action: "local"})
+		msg := newResponse(60)
+		msg.Id, msg.Question = req.Id, req.Question
+		return msg, nil
+	})
+	firstDone, secondDone := make(chan error, 1), make(chan error, 1)
+	go func() { _, err := manager.Query(firstCtx, "local", upstream, req.Copy()); firstDone <- err }()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("shared work did not start")
+	}
+	go func() { _, err := manager.Query(secondCtx, "local", upstream, req.Copy()); secondDone <- err }()
+	waitFor(t, time.Second, func() bool { return logs.FilterMessage("DNS cache query waiting").Len() == 2 }, "both shared waiters")
+	cancel()
+	if err := <-firstDone; !errors.Is(err, context.Canceled) {
+		t.Fatalf("first waiter did not cancel: %v", err)
+	}
+	once.Do(func() { close(release) })
+	if err := <-secondDone; err != nil {
+		t.Fatalf("initiator canceled another client's work: %v", err)
+	}
+	if err := manager.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	querylog.Finish(firstCtx, first, nil)
+	querylog.Finish(secondCtx, second, nil)
+	var work trace.SpanContext
+	waiters := 0
+	for _, span := range recorder.Ended() {
+		if span.Name() == "cache.upstream" {
+			work = span.SpanContext()
+			if span.Parent().IsValid() || len(span.Links()) != 1 || span.Links()[0].SpanContext.TraceID() != first.SpanContext().TraceID() {
+				t.Fatal("shared work is not an independent trace linked to its initiator")
+			}
+		}
+	}
+	if !work.IsValid() || calls.Load() != 1 || querylog.Read(firstCtx).Work.TraceID() != work.TraceID() || !querylog.Read(secondCtx).Work.Equal(work) {
+		t.Fatal("callers did not share one upstream task")
+	}
+	for _, span := range recorder.Ended() {
+		if span.Name() == "cache.wait" {
+			waiters++
+			if len(span.Links()) != 1 || !span.Links()[0].SpanContext.Equal(work) || !span.Parent().IsValid() || span.SpanContext().TraceID() == work.TraceID() {
+				t.Fatal("waiter span lacks the shared task link or has the wrong parent")
+			}
+		}
+	}
+	if waiters != 2 || len(recorder.Started()) != len(recorder.Ended()) {
+		t.Fatalf("missing waiters or leaked spans: waiters=%d started=%d ended=%d", waiters, len(recorder.Started()), len(recorder.Ended()))
 	}
 }

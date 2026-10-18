@@ -19,6 +19,7 @@ import (
 	"github.com/miekg/dns"
 	"github.com/xxxsen/atlas/internal/querylog"
 	"github.com/xxxsen/atlas/internal/resolver/model"
+	"go.opentelemetry.io/otel/attribute"
 	"go.uber.org/zap"
 )
 
@@ -213,13 +214,15 @@ func (r *dohResolver) recordTransportFailure(ctx context.Context, state *dohTran
 	)
 }
 
-func (r *dohResolver) Query(ctx context.Context, req *dns.Msg) (*dns.Msg, error) {
+func (r *dohResolver) Query(ctx context.Context, req *dns.Msg) (response *dns.Msg, resultErr error) {
 	if ctx == nil {
 		return nil, fmt.Errorf("DoH resolver context is nil")
 	}
 	if req == nil {
 		return nil, fmt.Errorf("DoH resolver received a nil request")
 	}
+	ctx, span := querylog.StartUpstream(ctx, req, r.Name(), "doh")
+	defer func() { querylog.Finish(ctx, span, resultErr) }()
 	logger := querylog.Logger(ctx).With(zap.String("resolver", querylog.SafeText(r.Name())))
 	payload, err := req.Pack()
 	if err != nil {
@@ -271,6 +274,7 @@ func (r *dohResolver) Query(ctx context.Context, req *dns.Msg) (*dns.Msg, error)
 	if err := ValidateResponse(req, message); err != nil {
 		return nil, fmt.Errorf("validate DoH response: %w", err)
 	}
+	span.SetAttributes(attribute.Int("dns.response_code", message.Rcode))
 	logger.Debug("DoH resolver query succeeded", zap.Uint64("transport_generation", state.generation), zap.Int("answer_count", len(message.Answer)))
 	return message, nil
 }

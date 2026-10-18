@@ -11,6 +11,8 @@ import (
 
 	"github.com/miekg/dns"
 	"github.com/xxxsen/atlas/internal/querylog"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
 )
 
@@ -88,7 +90,7 @@ func (p *groupResolver) buildAttempts(req *dns.Msg) []groupAttempt {
 	return attempts
 }
 
-func (p *groupResolver) Query(ctx context.Context, req *dns.Msg) (*dns.Msg, error) {
+func (p *groupResolver) Query(ctx context.Context, req *dns.Msg) (response *dns.Msg, resultErr error) {
 	if ctx == nil {
 		return nil, fmt.Errorf("group resolver context is nil")
 	}
@@ -99,6 +101,8 @@ func (p *groupResolver) Query(ctx context.Context, req *dns.Msg) (*dns.Msg, erro
 		return nil, fmt.Errorf("group resolver requires exactly one DNS question")
 	}
 	ctx = querylog.WithQuery(ctx, req)
+	ctx, span := querylog.Start(ctx, "resolver.group", trace.WithAttributes(attribute.String("atlas.action", querylog.SafeText(p.label)), attribute.Int("atlas.parallel", p.concurrent)))
+	defer func() { querylog.Finish(ctx, span, resultErr) }()
 	start := time.Now()
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()

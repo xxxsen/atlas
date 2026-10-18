@@ -4,7 +4,6 @@ package querylog
 
 import (
 	"context"
-	"crypto/rand"
 	"net/url"
 	"regexp"
 	"strings"
@@ -12,8 +11,8 @@ import (
 	"time"
 
 	"github.com/miekg/dns"
-	"github.com/xxxsen/common/logutil"
-	"github.com/xxxsen/common/trace"
+	commonlogger "github.com/xxxsen/common/logger"
+	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
 )
 
@@ -36,7 +35,7 @@ type Snapshot struct {
 	FallbackExecuted bool
 	CacheNamespace   string
 	CacheStatus      string
-	WorkID           string
+	Work             trace.SpanContext
 }
 
 type state struct {
@@ -44,16 +43,11 @@ type state struct {
 	data       Snapshot
 	domain     string
 	qtype      uint16
-	parentID   string
 	background bool
 }
 
 type stateKey struct{}
 type loggerKey struct{}
-
-// NewID returns a random alphanumeric ID for requests and detached work.
-// IDs do not depend on process-local counters that reset after a restart.
-func NewID() string { return rand.Text() }
 
 // WithLogger provides a logger for this query and its detached work. It also
 // allows log assertions without replacing the process-wide logger in tests.
@@ -68,9 +62,6 @@ func WithQuery(ctx context.Context, req *dns.Msg) context.Context {
 	if _, ok := ctx.Value(stateKey{}).(*state); ok {
 		return ctx
 	}
-	if ID(ctx) == "" {
-		ctx = trace.WithTraceId(ctx, NewID())
-	}
 	s := &state{}
 	if req != nil && len(req.Question) == 1 {
 		s.domain, s.qtype = req.Question[0].Name, req.Question[0].Qtype
@@ -78,39 +69,24 @@ func WithQuery(ctx context.Context, req *dns.Msg) context.Context {
 	return context.WithValue(ctx, stateKey{}, s)
 }
 
-// Fork preserves diagnostic context while retaining the manager's lifetime.
-// Each operation has its own ID; cache waiters log that ID to identify shared
-// work and background refreshes have an explicit parent_traceid.
-func Fork(parent, source context.Context, id string, background bool) context.Context {
-	s := &state{parentID: ID(source), background: background}
-	if previous, ok := source.Value(stateKey{}).(*state); ok {
-		s.domain, s.qtype = previous.domain, previous.qtype
-		s.background = s.background || previous.background
-	}
-	ctx := trace.WithTraceId(parent, id)
-	if logger, ok := source.Value(loggerKey{}).(*zap.Logger); ok {
-		ctx = WithLogger(ctx, logger)
-	}
-	return context.WithValue(ctx, stateKey{}, s)
-}
-
 func ID(ctx context.Context) string {
-	id, _ := trace.GetTraceId(ctx)
-	return id
+	sc := trace.SpanContextFromContext(ctx)
+	if !sc.IsValid() {
+		return ""
+	}
+	return sc.TraceID().String()
 }
 
 func Logger(ctx context.Context) *zap.Logger {
 	logger, ok := ctx.Value(loggerKey{}).(*zap.Logger)
 	if !ok {
-		logger = logutil.GetLogger(ctx)
-	} else if id := ID(ctx); id != "" {
-		logger = logger.With(zap.String("traceid", id))
+		logger = commonlogger.Logger()
+	}
+	if sc := trace.SpanContextFromContext(ctx); sc.IsValid() {
+		logger = logger.With(zap.String("trace_id", sc.TraceID().String()), zap.String("span_id", sc.SpanID().String()))
 	}
 	if s, ok := ctx.Value(stateKey{}).(*state); ok {
 		logger = logger.With(zap.String("domain", s.domain), zap.Uint16("qtype", s.qtype), zap.Bool("background", s.background))
-		if s.parentID != "" {
-			logger = logger.With(zap.String("parent_traceid", s.parentID))
-		}
 	}
 	return logger
 }
@@ -154,11 +130,11 @@ func SetCache(ctx context.Context, namespace, status string) {
 	}
 }
 
-func SetWork(ctx context.Context, id string) {
+func SetWork(ctx context.Context, work trace.SpanContext) {
 	if s, ok := ctx.Value(stateKey{}).(*state); ok {
 		s.mu.Lock()
 		defer s.mu.Unlock()
-		s.data.WorkID = id
+		s.data.Work = work
 	}
 }
 
@@ -168,14 +144,23 @@ func Fields(ctx context.Context) []zap.Field {
 		zap.String("result_source", s.Result.Source), zap.String("result_resolver", s.Result.Resolver),
 		zap.String("result_action", s.Result.Action), zap.Bool("result_via_fallback", s.Result.ViaFallback),
 		zap.String("cache_namespace", s.CacheNamespace), zap.String("cache_status", s.CacheStatus),
-		zap.String("upstream_traceid", s.WorkID),
 	}
+	fields = append(fields, WorkFields("work", s.Work)...)
 	// A timed-out shared flight can still be running. Omit an unobserved false
 	// value rather than suggesting that no fallback occurred in that work.
 	if s.Result.Source != "" || s.FallbackExecuted {
 		fields = append(fields, zap.Bool("fallback_executed", s.FallbackExecuted))
 	}
 	return fields
+}
+
+// WorkFields makes cross-trace links searchable in ordinary log files as well
+// as in exported spans. All identifiers come from OpenTelemetry SpanContexts.
+func WorkFields(prefix string, sc trace.SpanContext) []zap.Field {
+	if !sc.IsValid() {
+		return nil
+	}
+	return []zap.Field{zap.String(prefix+"_trace_id", sc.TraceID().String()), zap.String(prefix+"_span_id", sc.SpanID().String())}
 }
 
 func Elapsed(start time.Time) zap.Field {

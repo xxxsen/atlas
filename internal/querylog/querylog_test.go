@@ -6,7 +6,6 @@ import (
 	"testing"
 
 	"github.com/miekg/dns"
-	"github.com/xxxsen/common/trace"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 	"go.uber.org/zap/zaptest/observer"
@@ -17,17 +16,20 @@ func TestDetachedWorkKeepsDiagnosticsAndHasIndependentState(t *testing.T) {
 	req := new(dns.Msg)
 	req.SetQuestion("example.test.", dns.TypeAAAA)
 	caller, cancel := context.WithCancel(context.Background())
-	caller = WithQuery(WithLogger(trace.WithTraceId(caller, "client-1"), zap.New(core)), req)
+	caller = WithQuery(WithLogger(caller, zap.New(core)), req)
+	caller, clientSpan := Start(caller, "dns.query")
+	defer Finish(caller, clientSpan, nil)
 	SetResult(caller, Result{Source: "cache", Action: "local"})
-	work := Fork(context.Background(), caller, "refresh-1", true)
+	work, workSpan := Fork(context.Background(), caller, "cache.refresh", true)
+	defer Finish(work, workSpan, nil)
 	cancel()
-	if work.Err() != nil || ID(work) != "refresh-1" {
+	if work.Err() != nil || ID(work) == "" || ID(work) == ID(caller) {
 		t.Fatal("detached work inherited client cancellation or lost its ID")
 	}
 	SetResult(work, Result{Source: "upstream", Resolver: "remote", Action: "foreign"})
 	Logger(work).Info("refresh test")
 	entry := logs.All()[0].ContextMap()
-	if entry["traceid"] != "refresh-1" || entry["parent_traceid"] != "client-1" || entry["domain"] != "example.test." || entry["background"] != true {
+	if entry["trace_id"] != ID(work) || entry["span_id"] != workSpan.SpanContext().SpanID().String() || entry["parent_traceid"] != nil || entry["domain"] != "example.test." || entry["background"] != true {
 		t.Fatalf("lost detached query context: %+v", entry)
 	}
 	if Read(caller).Result.Source != "cache" {

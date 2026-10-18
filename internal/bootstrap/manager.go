@@ -21,6 +21,8 @@ import (
 	"github.com/xxxsen/atlas/internal/querylog"
 	"github.com/xxxsen/atlas/internal/resolver"
 	"github.com/xxxsen/common/logutil"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
 )
 
@@ -55,7 +57,7 @@ type flight struct {
 	done chan struct{}
 	data candidate
 	err  error
-	id   string
+	span trace.Span
 }
 
 // Manager owns authenticated discovery, per-domain versions, bounded caching,
@@ -209,7 +211,7 @@ func normalizeCacheOptions(c *resolver.CacheOptions) error {
 
 // Resolve handles only exact names from files. Unsupported types are locally
 // empty; missing address families are derived from the signed set, never DNS.
-func (m *Manager) Resolve(ctx context.Context, req *dns.Msg) (*dns.Msg, bool, error) {
+func (m *Manager) Resolve(ctx context.Context, req *dns.Msg) (message *dns.Msg, handled bool, resultErr error) {
 	if req == nil || len(req.Question) != 1 {
 		return nil, false, fmt.Errorf("bootstrap requires exactly one question")
 	}
@@ -224,6 +226,8 @@ func (m *Manager) Resolve(ctx context.Context, req *dns.Msg) (*dns.Msg, bool, er
 		return nil, true, fmt.Errorf("bootstrap context is nil")
 	}
 	ctx = querylog.WithQuery(ctx, req)
+	ctx, span := querylog.Start(ctx, "bootstrap.resolve", trace.WithAttributes(attribute.String("bootstrap.txt_domain", m.domains[domain])))
+	defer func() { querylog.Finish(ctx, span, resultErr) }()
 	querylog.SetResult(ctx, querylog.Result{Source: "bootstrap", Action: "bootstrap"})
 	if req.Question[0].Qclass != dns.ClassINET {
 		msg := new(dns.Msg)
@@ -245,10 +249,10 @@ func (m *Manager) Resolve(ctx context.Context, req *dns.Msg) (*dns.Msg, bool, er
 			// Signature validity is independent of DNS TTL and lazy max_stale.
 			if entry.record.validAt(now, m.config.skew()) == nil && now.Before(entry.stale) {
 				stale := !now.Before(entry.fresh)
-				refreshID := ""
+				var refresh trace.SpanContext
 				if stale {
 					if work := m.startFlightLocked(domain, ctx, true); work != nil {
-						refreshID = work.id
+						refresh = work.span.SpanContext()
 					}
 				}
 				m.mu.Unlock()
@@ -262,7 +266,8 @@ func (m *Manager) Resolve(ctx context.Context, req *dns.Msg) (*dns.Msg, bool, er
 				}
 				querylog.SetCache(ctx, "bootstrap", status)
 				querylog.SetResult(ctx, bootstrapResult(entry.candidate))
-				querylog.Logger(ctx).Debug("bootstrap cache hit", append(querylog.Fields(ctx), zap.String("refresh_traceid", refreshID), zap.String("key_id", entry.record.KeyID), zap.Int64("issued_at", entry.record.IssuedAt), zap.Int64("expires_at", entry.record.ExpiresAt))...)
+				fields := append(querylog.Fields(ctx), querylog.WorkFields("refresh", refresh)...)
+				querylog.Logger(ctx).Debug("bootstrap cache hit", append(fields, zap.String("key_id", entry.record.KeyID), zap.Int64("issued_at", entry.record.IssuedAt), zap.Int64("expires_at", entry.record.ExpiresAt))...)
 				return response(req, entry.record, ttl), true, nil
 			}
 			m.removeCacheLocked(domain)
@@ -271,8 +276,11 @@ func (m *Manager) Resolve(ctx context.Context, req *dns.Msg) (*dns.Msg, bool, er
 	work := m.startFlightLocked(domain, ctx, false)
 	m.mu.Unlock()
 	querylog.SetCache(ctx, "bootstrap", "miss")
-	querylog.SetWork(ctx, work.id)
-	querylog.Logger(ctx).Debug("bootstrap query waiting", zap.String("upstream_traceid", work.id), zap.String("txt_domain", m.domains[domain]))
+	sc := work.span.SpanContext()
+	querylog.SetWork(ctx, sc)
+	ctx, waitSpan := querylog.Start(ctx, "bootstrap.wait", trace.WithLinks(trace.Link{SpanContext: sc}))
+	defer func() { querylog.Finish(ctx, waitSpan, resultErr) }()
+	querylog.Logger(ctx).Debug("bootstrap query waiting", append(querylog.WorkFields("work", sc), zap.String("txt_domain", m.domains[domain]))...)
 	select {
 	case <-ctx.Done():
 		return nil, true, ctx.Err()
@@ -336,9 +344,13 @@ func (m *Manager) startFlightLocked(domain string, caller context.Context, backg
 			return nil
 		}
 	}
-	work := &flight{done: make(chan struct{}), id: querylog.NewID()}
+	name := "bootstrap.query"
+	if background {
+		name = "bootstrap.refresh"
+	}
+	parent, workSpan := querylog.Fork(m.ctx, caller, name, background)
+	work := &flight{done: make(chan struct{}), span: workSpan}
 	m.flights[domain] = work
-	parent := querylog.Fork(m.ctx, caller, work.id, background)
 	queryCtx, cancel := context.WithTimeout(parent, time.Duration(m.config.RequestTimeout)*time.Second)
 	if !background {
 		if deadline, ok := caller.Deadline(); ok {
@@ -352,6 +364,8 @@ func (m *Manager) startFlightLocked(domain string, caller context.Context, backg
 	go func() {
 		defer m.tasks.Done()
 		defer cancel()
+		var err error
+		defer func() { querylog.Finish(queryCtx, workSpan, err) }()
 		if background {
 			defer func() { <-m.refreshSem }()
 		}
@@ -506,6 +520,8 @@ func (m *Manager) collect(ctx context.Context, domain string) (candidate, error)
 }
 
 func (m *Manager) queryUpstream(ctx context.Context, domain string, upstream resolver.IDNSResolver) (values []candidate, resultErr error) {
+	ctx, span := querylog.Start(ctx, "bootstrap.upstream", trace.WithAttributes(attribute.String("atlas.resolver", querylog.SafeText(upstream.Name())), attribute.String("bootstrap.txt_domain", m.domains[domain])))
+	defer func() { querylog.Finish(ctx, span, resultErr) }()
 	start := time.Now()
 	logger := querylog.Logger(ctx).With(zap.String("resolver", querylog.SafeText(upstream.Name())), zap.String("txt_domain", m.domains[domain]), zap.Uint16("upstream_qtype", dns.TypeTXT))
 	rejected := 0
@@ -554,6 +570,7 @@ func (m *Manager) queryUpstream(ctx context.Context, domain string, upstream res
 		if err != nil {
 			lastErr = err
 			rejected++
+			span.AddEvent("bootstrap.candidate.rejected", trace.WithAttributes(attribute.Int("bootstrap.txt_index", count), attribute.String("error.message", querylog.SafeText(err.Error()))))
 			fields := []zap.Field{zap.Int("txt_index", count), querylog.Error(err)}
 			if id, decodeErr := hex.DecodeString(record.KeyID); decodeErr == nil && len(id) == 32 {
 				fields = append(fields, zap.String("candidate_key_id", record.KeyID))
@@ -565,6 +582,7 @@ func (m *Manager) queryUpstream(ctx context.Context, domain string, upstream res
 		values = append(values, candidate{record: record, wire: wire,
 			fresh: now.Add(time.Duration(ttl) * time.Second), source: upstream.Name()})
 		logger.Debug("bootstrap TXT candidate verified", zap.Int("txt_index", count), zap.String("key_id", record.KeyID), zap.Int64("issued_at", record.IssuedAt), zap.Int64("expires_at", record.ExpiresAt))
+		span.AddEvent("bootstrap.candidate.verified", trace.WithAttributes(attribute.Int("bootstrap.txt_index", count), attribute.String("bootstrap.key_id", record.KeyID), attribute.Int64("bootstrap.issued_at", record.IssuedAt), attribute.Int64("bootstrap.expires_at", record.ExpiresAt)))
 	}
 	if len(values) == 0 {
 		if lastErr == nil {

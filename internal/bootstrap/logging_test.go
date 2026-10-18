@@ -11,7 +11,8 @@ import (
 	"github.com/miekg/dns"
 	"github.com/xxxsen/atlas/internal/bootstrap"
 	"github.com/xxxsen/atlas/internal/querylog"
-	"github.com/xxxsen/common/trace"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 	"go.uber.org/zap/zaptest/observer"
@@ -50,7 +51,12 @@ func TestTXTRejectionIsLoggedEvenWhenAnUpstreamAlsoReturnsValidData(t *testing.T
 				return txtReply(req, 60, bad, valid), nil
 			}}, answer(f.wire("disk.sendev.cc", "1.2.3.4", version, time.Hour), 60))
 			core, logs := observer.New(zapcore.DebugLevel)
-			ctx := querylog.WithLogger(trace.WithTraceId(context.Background(), "bootstrap-client"), zap.New(core))
+			recorder := tracetest.NewSpanRecorder()
+			provider := sdktrace.NewTracerProvider(sdktrace.WithSampler(sdktrace.AlwaysSample()), sdktrace.WithSpanProcessor(recorder))
+			t.Cleanup(func() { _ = provider.Shutdown(context.Background()) })
+			ctx := querylog.WithLogger(querylog.WithTracerProvider(context.Background(), provider), zap.New(core))
+			ctx, clientSpan := querylog.Start(ctx, "dns.query")
+			defer querylog.Finish(ctx, clientSpan, nil)
 			req := new(dns.Msg)
 			req.SetQuestion("disk.sendev.cc.", dns.TypeA)
 			_, handled, err := m.Resolve(ctx, req)
@@ -65,12 +71,26 @@ func TestTXTRejectionIsLoggedEvenWhenAnUpstreamAlsoReturnsValidData(t *testing.T
 				t.Fatalf("missing rejected candidate log: %+v", rejected)
 			}
 			fields := rejected[0].ContextMap()
-			if rejected[0].Level != zapcore.WarnLevel || !strings.Contains(fmt.Sprint(fields["error"]), reason) || fields["resolver"] != "mixed-upstream" || fields["txt_domain"] != "_atlas.disk.sendev.cc" || fields["parent_traceid"] != "bootstrap-client" || fields["candidate_key_id"] == nil {
+			if rejected[0].Level != zapcore.WarnLevel || !strings.Contains(fmt.Sprint(fields["error"]), reason) || fields["resolver"] != "mixed-upstream" || fields["txt_domain"] != "_atlas.disk.sendev.cc" || fields["trace_id"] == nil || fields["span_id"] == nil || fields["parent_traceid"] != nil || fields["candidate_key_id"] == nil {
 				t.Fatalf("insufficient TXT rejection context: %+v", fields)
 			}
 			accepted := logs.FilterMessage("accepted signed bootstrap addresses").All()
 			if len(accepted) != 1 || accepted[0].ContextMap()["result_resolver"] != "mixed-upstream" {
 				t.Fatalf("missing selected source: %+v", accepted)
+			}
+			linked, rejectedEvent := false, false
+			for _, span := range recorder.Ended() {
+				if span.Name() == "bootstrap.query" {
+					linked = !span.Parent().IsValid() && len(span.Links()) == 1 && span.Links()[0].SpanContext.TraceID() == clientSpan.SpanContext().TraceID()
+				}
+				for _, event := range span.Events() {
+					if event.Name == "bootstrap.candidate.rejected" {
+						rejectedEvent = span.SpanContext().TraceID().String() == fields["trace_id"] && span.SpanContext().SpanID().String() == fields["span_id"]
+					}
+				}
+			}
+			if !linked || !rejectedEvent {
+				t.Fatal("missing bootstrap Span Link or candidate rejection event")
 			}
 			for _, entry := range logs.All() {
 				text := fmt.Sprint(entry.ContextMap())

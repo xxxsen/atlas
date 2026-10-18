@@ -13,6 +13,8 @@ import (
 	"github.com/xxxsen/atlas/internal/querylog"
 	"github.com/xxxsen/atlas/internal/resolver"
 	"github.com/xxxsen/atlas/internal/strictdecode"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
 )
 
@@ -27,13 +29,15 @@ func (f *forwardAction) Name() string {
 	return f.name
 }
 
-func (f *forwardAction) Perform(ctx context.Context, req *dns.Msg) (*dns.Msg, error) {
+func (f *forwardAction) Perform(ctx context.Context, req *dns.Msg) (response *dns.Msg, resultErr error) {
 	if ctx == nil {
 		return nil, fmt.Errorf("forward action context is nil")
 	}
 	ctx = querylog.WithQuery(ctx, req)
 	ctx, cancel := resolver.WithQueryBudget(ctx, f.queryTimeout)
 	defer cancel()
+	ctx, span := querylog.Start(ctx, "forward", trace.WithAttributes(attribute.String("atlas.action", querylog.SafeText(f.name))))
+	defer func() { querylog.Finish(ctx, span, resultErr) }()
 	start := time.Now()
 	logger := querylog.Logger(ctx).With(zap.String("action", f.name), zap.String("target_resolver", querylog.SafeText(f.r.Name())))
 	logger.Debug("forward action start")

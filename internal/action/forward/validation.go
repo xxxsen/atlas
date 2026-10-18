@@ -12,6 +12,8 @@ import (
 	"github.com/xxxsen/atlas/internal/ipset"
 	"github.com/xxxsen/atlas/internal/querylog"
 	"github.com/xxxsen/atlas/internal/resolver"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
 )
 
@@ -27,7 +29,7 @@ type validatedResolver struct {
 
 func (r *validatedResolver) Name() string { return r.primary.Name() }
 
-func (r *validatedResolver) Query(ctx context.Context, req *dns.Msg) (*dns.Msg, error) {
+func (r *validatedResolver) Query(ctx context.Context, req *dns.Msg) (response *dns.Msg, resultErr error) {
 	start := time.Now()
 	msg, err := r.primary.Query(ctx, req)
 	if err != nil {
@@ -37,17 +39,27 @@ func (r *validatedResolver) Query(ctx context.Context, req *dns.Msg) (*dns.Msg, 
 	if !rejected {
 		return msg, nil
 	}
+	primaryResolver := querylog.Read(ctx).Result.Resolver
+	primaryElapsed := float64(time.Since(start)) / float64(time.Millisecond)
 	logger := querylog.Logger(ctx).With(
 		zap.String("action", r.name), zap.String("fallback", r.fallbackName),
-		zap.String("primary_resolver", querylog.Read(ctx).Result.Resolver),
-		zap.Float64("primary_elapsed_ms", float64(time.Since(start))/float64(time.Millisecond)),
+		zap.String("primary_resolver", primaryResolver),
+		zap.Float64("primary_elapsed_ms", primaryElapsed),
 		zap.String("rejected_ip", address), zap.String("reason", "address_validation"))
 	logger.Warn("forward response failed address validation")
+	trace.SpanFromContext(ctx).AddEvent("forward.validation.failed", trace.WithAttributes(attribute.String("atlas.rejected_ip", address), attribute.String("atlas.fallback", r.fallbackName)))
 	querylog.StartFallback(ctx)
 	if r.fallback == nil {
 		return nil, fmt.Errorf("forward action %q fallback %q is not bound", r.name, r.fallbackName)
 	}
 	fallbackStart := time.Now()
+	ctx, span := querylog.Start(ctx, "forward.fallback", trace.WithAttributes(attribute.String("atlas.action", r.name), attribute.String("atlas.fallback", r.fallbackName), attribute.String("atlas.rejected_ip", address)))
+	defer func() { querylog.Finish(ctx, span, resultErr) }()
+	logger = querylog.Logger(ctx).With(
+		zap.String("action", r.name), zap.String("fallback", r.fallbackName),
+		zap.String("primary_resolver", primaryResolver),
+		zap.Float64("primary_elapsed_ms", primaryElapsed),
+		zap.String("rejected_ip", address), zap.String("reason", "address_validation"))
 	msg, err = r.fallback.Perform(ctx, req)
 	if err != nil {
 		querylog.SetResult(ctx, querylog.Result{})

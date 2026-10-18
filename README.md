@@ -371,17 +371,39 @@ legacy.test 192.0.2.20 2001:db8::20
 
 TXT 候选校验失败会单独记录，即使同次响应或其他上游提供了有效数据，也不会隐藏该失败。日志包含 `domain`、实际查询的 `txt_domain`、`resolver`、`txt_index`、拒绝原因；可解码的公钥标识记为 `candidate_key_id`，已接受记录另有 `key_id`、`issued_at`、`expires_at`。不输出完整 TXT 载荷、签名或私钥；上游 URL 的用户名、密码、查询参数和 fragment 会被移除，外部错误文本有长度上限。
 
-每条请求使用 `traceid`。请求、缓存共享查询与后台刷新统一使用标准库 `crypto/rand.Text()` 生成的字母数字随机 ID（当前为 26 位 Base32，包含大写字母 A–Z 和数字 2–7，至少 128 bit 随机性），避免递增计数在重启或多实例日志合并时重号。每个共享查询和刷新任务都有独立 ID，通过 `parent_traceid` 指向发起者；等待共享结果的其他客户端通过 `upstream_traceid` 关联同一任务。乐观缓存命中日志还给出 `refresh_traceid`，刷新任务带 `background: true`，不会与当次立即返回的缓存结果混淆。
+追踪采用 OpenTelemetry，日志统一输出 `trace_id`（32 位十六进制）和 `span_id`（16 位十六进制）。普通父子调用共享 Trace ID，SDK 根据 context 维护父子 Span；DNS 请求、规则执行、转发、上游访问、TXT bootstrap 和 fallback 均有对应 Span。
+
+共享上游查询和后台刷新使用独立 Trace，通过 Span Link 关联发起者；每个等待者还有一个链接到共享任务的等待 Span，任务的取消仍由缓存管理器控制。普通日志通过 `work_trace_id` / `work_span_id` 查找共享任务，通过 `refresh_trace_id` / `refresh_span_id` 查找乐观缓存触发的刷新；刷新任务带 `background: true`。这些字段均来自 SDK 的 SpanContext，不再手工生成 ID 或维护 `parent_traceid`。
 
 fallback 日志包含来源 action、目标 `fallback`、`primary_resolver`、`rejected_ip`、`primary_elapsed_ms`、`fallback_elapsed_ms`、`elapsed_ms`；查询汇总包含最终 `result_resolver`、`result_action`、`ips`、`rcode`、缓存状态和耗时。下面是字段示意（实际日志由现有 logger 输出）：
 
 ```json
-{"msg":"forward fallback succeeded","traceid":"J7M3Q2V5CX6RN4H7D2P5ZA6TBE","parent_traceid":"B4Q6R3M7K2V5CX6TN4H7D2P5ZA","domain":"example.cn.","action":"local","fallback":"remote","primary_resolver":"doh:https://223.5.5.5/dns-query","rejected_ip":"203.0.113.10","result_resolver":"doh:https://1.1.1.1/dns-query","primary_elapsed_ms":18,"fallback_elapsed_ms":1240,"elapsed_ms":1258}
+{"msg":"forward fallback succeeded","trace_id":"4bf92f3577b34da6a3ce929d0e0e4736","span_id":"00f067aa0ba902b7","domain":"example.cn.","action":"local","fallback":"remote","primary_resolver":"doh:https://223.5.5.5/dns-query","rejected_ip":"203.0.113.10","result_resolver":"doh:https://1.1.1.1/dns-query","primary_elapsed_ms":18,"fallback_elapsed_ms":1240,"elapsed_ms":1258}
 ```
 
 新写入的普通 DNS 缓存会同时保存结果来源，并兼容已有缓存文件。`result_via_fallback: true` 表示该数据最初通过回退获得；`fallback_executed: true` 表示本次查询实际执行过回退，缓存命中不会被误报为新回退。超时而尚未拿到共享任务状态时，不输出未确认的 `fallback_executed: false`。旧缓存没有来源元数据时标记 `result_resolver: unknown`；bootstrap 检查点保持现有格式，重启恢复后也不会猜测此前的 TXT 上游。
 
-日常可保留 `log.level: info`，异常和慢查询无需开启 DEBUG。需要追踪每次查询时，将现有配置中的 `log.level` 改为 `debug` 后重启；保留原有文件、轮转和控制台配置。先按域名与时间找到事件，再按 `traceid`、`parent_traceid`、`upstream_traceid` 关联各阶段。`elapsed_ms`、`proc_ms`、`write_ms` 等带 `_ms` 的字段均为毫秒。
+日常可保留 `log.level: info`，异常和慢查询无需开启 DEBUG。需要追踪每次查询时，将现有配置中的 `log.level` 改为 `debug` 后重启；保留原有文件、轮转和控制台配置。先按域名与时间找到事件，再按 `trace_id`、`span_id` 和共享任务字段关联各阶段。`elapsed_ms`、`proc_ms`、`write_ms` 等带 `_ms` 的字段均为毫秒。
+
+### OpenTelemetry 导出
+
+默认 `OTEL_TRACES_EXPORTER=none`，使用不录制 Span 的 SDK 生成有效的日志关联 ID，不需要追踪后端。`OTEL_TRACES_EXPORTER=console` 可将 Span 以 JSON 输出到标准输出，便于临时验证父子关系、Span Links 和 TXT 验证事件；这独立于业务日志的 `log.console` 设置。
+
+需要向 Collector、Tempo 或 Jaeger 导出时，设置 `OTEL_TRACES_EXPORTER=otlp`，使用 OTLP HTTP/protobuf。例如在 Compose 的 `atlas.environment` 下加入：
+
+```yaml
+environment:
+  OTEL_TRACES_EXPORTER: otlp
+  OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
+  OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
+  OTEL_SERVICE_NAME: atlas
+  OTEL_TRACES_SAMPLER: parentbased_traceidratio
+  OTEL_TRACES_SAMPLER_ARG: "0.1"
+```
+
+SDK 支持标准的 `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`（完整 traces URL）、请求头、超时、资源属性与采样环境变量；仅支持 HTTP/protobuf，其他协议会在启动时报错。启用导出时，未配置采样器采用 SDK 默认的 ParentBased(AlwaysOn)；例如临时验证可设置 `OTEL_TRACES_SAMPLER=always_on`。采样只影响 Span 录制和导出，业务日志及其关联 ID 保持可用。
+
+导出使用 SDK 有界异步队列，队列满时丢弃 Span，导出失败记录 WARN，不阻塞 DNS 查询。退出时先等待查询和刷新任务结束，再在最多 5 秒内关闭导出器。父子关系和 Span Links 由导出后的追踪数据呈现；本地文件日志仍可独立排查。参考 [Go SDK 文档](https://opentelemetry.io/docs/languages/go/instrumentation/) 与 [环境变量说明](https://opentelemetry.io/docs/specs/otel/configuration/sdk-environment-variables/)。
 
 启用 pprof 后可访问：
 
