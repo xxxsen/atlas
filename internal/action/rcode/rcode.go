@@ -6,6 +6,7 @@ import (
 
 	"github.com/miekg/dns"
 	"github.com/xxxsen/atlas/internal/action"
+	"github.com/xxxsen/atlas/internal/querylog"
 	"github.com/xxxsen/atlas/internal/strictdecode"
 )
 
@@ -30,6 +31,7 @@ func (a *rcodeAction) Perform(ctx context.Context, req *dns.Msg) (*dns.Msg, erro
 	resp.Answer = nil
 	resp.Ns = nil
 	resp.Extra = nil
+	querylog.SetResult(ctx, querylog.Result{Source: "rcode", Action: a.name})
 
 	return resp, nil
 }

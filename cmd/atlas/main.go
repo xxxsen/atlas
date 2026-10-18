@@ -84,6 +84,13 @@ func run(configPath string) (returnErr error) {
 	if err != nil {
 		return fmt.Errorf("initialize IP sets: %w", err)
 	}
+	for _, set := range cfg.Resource.IPSet {
+		format := strings.ToLower(strings.TrimSpace(set.Format))
+		if format == "" {
+			format = "cidr"
+		}
+		logkit.Info("loaded IP set", zap.String("name", set.Name), zap.String("format", format), zap.Strings("files", set.Files), zap.Strings("countries", set.Countries), zap.Int("cidr_count", ipSets.Count(set.Name)))
+	}
 
 	var cacheManager *resolver.CacheManager
 	cacheOptions, err := makeCacheOptions(cfg)

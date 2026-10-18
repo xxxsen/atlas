@@ -5,12 +5,13 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"time"
 
 	"github.com/miekg/dns"
 	"github.com/xxxsen/atlas/internal/action"
 	"github.com/xxxsen/atlas/internal/ipset"
+	"github.com/xxxsen/atlas/internal/querylog"
 	"github.com/xxxsen/atlas/internal/resolver"
-	"github.com/xxxsen/common/logutil"
 	"go.uber.org/zap"
 )
 
@@ -27,6 +28,7 @@ type validatedResolver struct {
 func (r *validatedResolver) Name() string { return r.primary.Name() }
 
 func (r *validatedResolver) Query(ctx context.Context, req *dns.Msg) (*dns.Msg, error) {
+	start := time.Now()
 	msg, err := r.primary.Query(ctx, req)
 	if err != nil {
 		return nil, err
@@ -35,20 +37,31 @@ func (r *validatedResolver) Query(ctx context.Context, req *dns.Msg) (*dns.Msg, 
 	if !rejected {
 		return msg, nil
 	}
-	logger := logutil.GetLogger(ctx).With(
+	logger := querylog.Logger(ctx).With(
 		zap.String("action", r.name), zap.String("fallback", r.fallbackName),
-		zap.String("domain", req.Question[0].Name), zap.Uint16("qtype", req.Question[0].Qtype),
-		zap.String("rejected_ip", address))
+		zap.String("primary_resolver", querylog.Read(ctx).Result.Resolver),
+		zap.Float64("primary_elapsed_ms", float64(time.Since(start))/float64(time.Millisecond)),
+		zap.String("rejected_ip", address), zap.String("reason", "address_validation"))
 	logger.Warn("forward response failed address validation")
+	querylog.StartFallback(ctx)
 	if r.fallback == nil {
 		return nil, fmt.Errorf("forward action %q fallback %q is not bound", r.name, r.fallbackName)
 	}
+	fallbackStart := time.Now()
 	msg, err = r.fallback.Perform(ctx, req)
 	if err != nil {
-		logger.Debug("forward fallback failed", zap.Error(err))
+		querylog.SetResult(ctx, querylog.Result{})
+		logger.Warn("forward fallback failed", querylog.Error(err), querylog.Elapsed(start), zap.Float64("fallback_elapsed_ms", float64(time.Since(fallbackStart))/float64(time.Millisecond)))
 		return nil, fmt.Errorf("forward action %q rejected IP %s; fallback %q failed: %w", r.name, address, r.fallbackName, err)
 	}
-	logger.Debug("forward fallback succeeded")
+	result := querylog.Read(ctx).Result
+	result.ViaFallback = true
+	querylog.SetResult(ctx, result)
+	rcode := -1
+	if msg != nil {
+		rcode = msg.Rcode
+	}
+	logger.Info("forward fallback succeeded", append(querylog.Fields(ctx), querylog.Elapsed(start), zap.Float64("fallback_elapsed_ms", float64(time.Since(fallbackStart))/float64(time.Millisecond)), zap.Int("rcode", rcode), zap.Strings("ips", querylog.IPs(msg)))...)
 	return msg, nil
 }
 

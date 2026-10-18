@@ -361,6 +361,28 @@ legacy.test 192.0.2.20 2001:db8::20
 
 ## 调试与指标
 
+日志按事件区分级别：
+
+| 级别 | 事件与定位信息 |
+| --- | --- |
+| INFO | bootstrap 初始化、公钥 ID、已接受的签名版本与地址；IP 集合的数据文件、国家选择、网段数量；fallback 成功及最终上游、地址和耗时。 |
+| WARN | TXT 候选验签失败、过期、域名不匹配、未知公钥，以及上游 TXT 查询失败、版本回退或冲突；响应地址校验失败、fallback 失败、后台刷新失败；总处理与写响应耗时达到 1 秒的慢查询。 |
+| DEBUG | 普通查询结果、各上游尝试与获胜者、缓存命中/过期/未命中/绕过、共享查询等待、后台刷新起止，以及已通过验证的 TXT 候选。 |
+
+TXT 候选校验失败会单独记录，即使同次响应或其他上游提供了有效数据，也不会隐藏该失败。日志包含 `domain`、实际查询的 `txt_domain`、`resolver`、`txt_index`、拒绝原因；可解码的公钥标识记为 `candidate_key_id`，已接受记录另有 `key_id`、`issued_at`、`expires_at`。不输出完整 TXT 载荷、签名或私钥；上游 URL 的用户名、密码、查询参数和 fragment 会被移除，外部错误文本有长度上限。
+
+每条请求使用 `traceid`。缓存共享查询与后台刷新使用独立的 `work-*` ID，并通过 `parent_traceid` 指向发起者；等待共享结果的其他客户端通过 `upstream_traceid` 关联同一任务。乐观缓存命中日志还给出 `refresh_traceid`，刷新任务带 `background: true`，不会与当次立即返回的缓存结果混淆。
+
+fallback 日志包含来源 action、目标 `fallback`、`primary_resolver`、`rejected_ip`、`primary_elapsed_ms`、`fallback_elapsed_ms`、`elapsed_ms`；查询汇总包含最终 `result_resolver`、`result_action`、`ips`、`rcode`、缓存状态和耗时。下面是字段示意（实际日志由现有 logger 输出）：
+
+```json
+{"msg":"forward fallback succeeded","traceid":"work-18","parent_traceid":"42","domain":"example.cn.","action":"local","fallback":"remote","primary_resolver":"doh:https://223.5.5.5/dns-query","rejected_ip":"203.0.113.10","result_resolver":"doh:https://1.1.1.1/dns-query","primary_elapsed_ms":18,"fallback_elapsed_ms":1240,"elapsed_ms":1258}
+```
+
+新写入的普通 DNS 缓存会同时保存结果来源，并兼容已有缓存文件。`result_via_fallback: true` 表示该数据最初通过回退获得；`fallback_executed: true` 表示本次查询实际执行过回退，缓存命中不会被误报为新回退。超时而尚未拿到共享任务状态时，不输出未确认的 `fallback_executed: false`。旧缓存没有来源元数据时标记 `result_resolver: unknown`；bootstrap 检查点保持现有格式，重启恢复后也不会猜测此前的 TXT 上游。
+
+日常可保留 `log.level: info`，异常和慢查询无需开启 DEBUG。需要追踪每次查询时，将现有配置中的 `log.level` 改为 `debug` 后重启；保留原有文件、轮转和控制台配置。先按域名与时间找到事件，再按 `traceid`、`parent_traceid`、`upstream_traceid` 关联各阶段。`elapsed_ms`、`proc_ms`、`write_ms` 等带 `_ms` 的字段均为毫秒。
+
 启用 pprof 后可访问：
 
 - `/debug/pprof/`

@@ -14,6 +14,7 @@ import (
 
 	"github.com/miekg/dns"
 	"github.com/xxxsen/atlas/internal/matcher"
+	"github.com/xxxsen/atlas/internal/querylog"
 	"github.com/xxxsen/atlas/internal/resolver"
 	"github.com/xxxsen/common/logutil"
 	"github.com/xxxsen/common/trace"
@@ -243,7 +244,8 @@ func (s *dnsServer) handleDNS(parent context.Context, w dns.ResponseWriter, req 
 		return
 	}
 	ctx = matcher.WithRequestMeta(ctx, req)
-	logger = logger.With(zap.String("domain", req.Question[0].Name), zap.Uint16("qtype", req.Question[0].Qtype))
+	ctx = querylog.WithQuery(ctx, req)
+	logger = querylog.Logger(ctx)
 	start := time.Now()
 	resp, err := s.processRequest(ctx, req)
 	if err == nil && resp == nil {
@@ -254,7 +256,7 @@ func (s *dnsServer) handleDNS(parent context.Context, w dns.ResponseWriter, req 
 	}
 	if err != nil {
 		s.pipelineErrors.Add(1)
-		logger.Error("process DNS request failed", zap.Error(err))
+		logger.Error("process DNS request failed", append(querylog.Fields(ctx), querylog.Error(err))...)
 		resp = new(dns.Msg)
 		resp.SetRcode(req, dns.RcodeServerFailure)
 	}
@@ -268,14 +270,24 @@ func (s *dnsServer) handleDNS(parent context.Context, w dns.ResponseWriter, req 
 	}
 	wrote = true
 	s.handled.Add(1)
-	if checked := logger.Check(zap.DebugLevel, "handled DNS request"); checked != nil {
-		checked.Write(
-			zap.Duration("proc_cost", writeStart.Sub(start)),
-			zap.Duration("write_cost", time.Since(writeStart)),
-			zap.String("ips", summariseIPs(resp)),
-			zap.Int("rcode", resp.Rcode),
-		)
+	logHandledRequest(ctx, resp, writeStart.Sub(start), time.Since(writeStart))
+}
+
+// Normal query details are opt-in. Slow queries remain visible at warn level.
+func logHandledRequest(ctx context.Context, resp *dns.Msg, processing, writing time.Duration) {
+	level, message := zap.DebugLevel, "handled DNS request"
+	if processing+writing >= time.Second {
+		level, message = zap.WarnLevel, "slow DNS request"
 	}
+	checked := querylog.Logger(ctx).Check(level, message)
+	if checked == nil {
+		return
+	}
+	fields := append(querylog.Fields(ctx),
+		zap.Float64("proc_ms", float64(processing)/float64(time.Millisecond)),
+		zap.Float64("write_ms", float64(writing)/float64(time.Millisecond)),
+		zap.Strings("ips", querylog.IPs(resp)), zap.Int("rcode", resp.Rcode))
+	checked.Write(fields...)
 }
 
 func (s *dnsServer) Stats() Stats {
@@ -379,22 +391,6 @@ func (s *dnsServer) responseUDPSize(req *dns.Msg) int {
 	return size
 }
 
-func summariseIPs(msg *dns.Msg) string {
-	addrs := make([]string, 0, len(msg.Answer))
-	for _, rr := range msg.Answer {
-		switch record := rr.(type) {
-		case *dns.A:
-			addrs = append(addrs, record.A.String())
-		case *dns.AAAA:
-			addrs = append(addrs, record.AAAA.String())
-		}
-	}
-	if len(addrs) > 3 {
-		addrs = append(addrs[:3], "...")
-	}
-	return strings.Join(addrs, ",")
-}
-
 func (s *dnsServer) processRequest(ctx context.Context, req *dns.Msg) (*dns.Msg, error) {
 	if s.c.bootstrap != nil {
 		response, handled, err := s.c.bootstrap.Resolve(ctx, req)
@@ -421,6 +417,7 @@ func (s *dnsServer) tryHosts(ctx context.Context, req *dns.Msg) (*dns.Msg, bool)
 	if len(response.Answer) == 0 {
 		return nil, false
 	}
-	logutil.GetLogger(ctx).Debug("DNS request matched hosts")
+	querylog.SetResult(ctx, querylog.Result{Source: "hosts", Action: "hosts"})
+	querylog.Logger(ctx).Debug("DNS request matched hosts", zap.Strings("ips", querylog.IPs(response)))
 	return response, true
 }

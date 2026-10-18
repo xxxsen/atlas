@@ -13,8 +13,8 @@ import (
 	"time"
 
 	"github.com/miekg/dns"
+	"github.com/xxxsen/atlas/internal/querylog"
 	"github.com/xxxsen/atlas/internal/resolver/model"
-	"github.com/xxxsen/common/logutil"
 	"go.uber.org/zap"
 )
 
@@ -96,7 +96,7 @@ func (r *classicResolver) Query(ctx context.Context, req *dns.Msg) (*dns.Msg, er
 	if req == nil {
 		return nil, fmt.Errorf("classic resolver received a nil request")
 	}
-	logger := logutil.GetLogger(ctx).With(zap.String("resolver", r.Name()), zap.String("server_addr", r.addr))
+	logger := querylog.Logger(ctx).With(zap.String("resolver", querylog.SafeText(r.Name())), zap.String("server_addr", r.addr))
 	var (
 		resp *dns.Msg
 		err  error

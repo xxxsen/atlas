@@ -15,17 +15,28 @@ import (
 	"github.com/xxxsen/atlas/internal/action"
 	_ "github.com/xxxsen/atlas/internal/action/rcode"
 	"github.com/xxxsen/atlas/internal/ipset"
+	"github.com/xxxsen/atlas/internal/querylog"
 	"github.com/xxxsen/atlas/internal/resolver"
 	"github.com/xxxsen/atlas/internal/resolver/model"
+	"github.com/xxxsen/common/trace"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	"go.uber.org/zap/zaptest/observer"
 )
 
 type policyUpstream struct {
+	name   string
 	calls  atomic.Int64
 	closes atomic.Int64
 	query  func(context.Context, *dns.Msg) (*dns.Msg, error)
 }
 
-func (r *policyUpstream) Name() string { return "policy-test" }
+func (r *policyUpstream) Name() string {
+	if r.name != "" {
+		return r.name
+	}
+	return "policy-test"
+}
 func (r *policyUpstream) Query(ctx context.Context, req *dns.Msg) (*dns.Msg, error) {
 	r.calls.Add(1)
 	return r.query(ctx, req)
@@ -505,5 +516,42 @@ func TestFailedLazyFallbackKeepsOldDataOnlyUntilMaxStale(t *testing.T) {
 	time.Sleep(350 * time.Millisecond)
 	if msg, err = cn.Perform(context.Background(), policyRequest()); err == nil || msg != nil {
 		t.Fatalf("failed refresh extended old cache beyond max_stale: %v, %v", msg, err)
+	}
+}
+
+func TestFallbackLogsCostsSourceAndSeparatesCachedProvenance(t *testing.T) {
+	cache := newPolicyCache(t)
+	deps := action.Dependencies{Cache: cache}
+	cn := makePolicyAction(t, "cn", []*policyUpstream{{name: "domestic-upstream", query: replyWithIP("1.1.1.1")}}, privatePolicy("remote"), deps)
+	remote := makePolicyAction(t, "remote", []*policyUpstream{{name: "foreign-upstream", query: replyWithIP("2.2.2.2")}}, nil, deps)
+	if err := action.ResolveReferences(map[string]action.IDNSAction{"cn": cn, "remote": remote}); err != nil {
+		t.Fatal(err)
+	}
+	core, logs := observer.New(zapcore.DebugLevel)
+	for _, id := range []string{"first-client", "second-client"} {
+		req := policyRequest()
+		ctx := querylog.WithQuery(querylog.WithLogger(trace.WithTraceId(context.Background(), id), zap.New(core)), req)
+		if _, err := cn.Perform(ctx, req); err != nil {
+			t.Fatal(err)
+		}
+		snapshot := querylog.Read(ctx)
+		if snapshot.Result.Resolver != "foreign-upstream" || snapshot.Result.Action != "remote" || !snapshot.Result.ViaFallback {
+			t.Fatalf("lost original response provenance: %+v", snapshot)
+		}
+		if snapshot.FallbackExecuted != (id == "first-client") {
+			t.Fatalf("cache hit was reported as executing fallback: %+v", snapshot)
+		}
+	}
+	trigger := logs.FilterMessage("forward response failed address validation").All()
+	finished := logs.FilterMessage("forward fallback succeeded").All()
+	if len(trigger) != 1 || len(finished) != 1 {
+		t.Fatalf("unexpected fallback events: %d %d", len(trigger), len(finished))
+	}
+	if fields := trigger[0].ContextMap(); fields["primary_resolver"] != "domestic-upstream" || fields["rejected_ip"] != "1.1.1.1" || fields["parent_traceid"] != "first-client" {
+		t.Fatalf("missing fallback trigger context: %+v", fields)
+	}
+	fields := finished[0].ContextMap()
+	if finished[0].Level != zapcore.InfoLevel || fields["result_resolver"] != "foreign-upstream" || fields["elapsed_ms"] == nil || fields["primary_elapsed_ms"] == nil || fields["fallback_elapsed_ms"] == nil {
+		t.Fatalf("missing fallback timing/source: %+v", fields)
 	}
 }

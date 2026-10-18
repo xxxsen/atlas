@@ -10,9 +10,9 @@ import (
 	"github.com/miekg/dns"
 	"github.com/xxxsen/atlas/internal/action"
 	"github.com/xxxsen/atlas/internal/ipset"
+	"github.com/xxxsen/atlas/internal/querylog"
 	"github.com/xxxsen/atlas/internal/resolver"
 	"github.com/xxxsen/atlas/internal/strictdecode"
-	"github.com/xxxsen/common/logutil"
 	"go.uber.org/zap"
 )
 
@@ -31,20 +31,24 @@ func (f *forwardAction) Perform(ctx context.Context, req *dns.Msg) (*dns.Msg, er
 	if ctx == nil {
 		return nil, fmt.Errorf("forward action context is nil")
 	}
+	ctx = querylog.WithQuery(ctx, req)
 	ctx, cancel := resolver.WithQueryBudget(ctx, f.queryTimeout)
 	defer cancel()
-	logger := logutil.GetLogger(ctx).With(zap.String("action", f.name), zap.String("target_resolver", f.r.Name()))
+	start := time.Now()
+	logger := querylog.Logger(ctx).With(zap.String("action", f.name), zap.String("target_resolver", querylog.SafeText(f.r.Name())))
 	logger.Debug("forward action start")
 	resp, err := f.r.Query(ctx, req)
 	if err != nil {
-		logger.Debug("forward action query failed", zap.Error(err))
+		logger.Debug("forward action query failed", querylog.Error(err), querylog.Elapsed(start))
 		return nil, err
 	}
 	ans := 0
 	if resp != nil {
 		ans = len(resp.Answer)
 	}
-	logger.Debug("forward action query success", zap.Int("answer_count", ans))
+	if checked := logger.Check(zap.DebugLevel, "forward action query success"); checked != nil {
+		checked.Write(append(querylog.Fields(ctx), zap.Int("answer_count", ans), zap.Strings("ips", querylog.IPs(resp)), querylog.Elapsed(start))...)
+	}
 	return resp, nil
 }
 

@@ -17,8 +17,8 @@ import (
 	"time"
 
 	"github.com/miekg/dns"
+	"github.com/xxxsen/atlas/internal/querylog"
 	"github.com/xxxsen/atlas/internal/resolver/model"
-	"github.com/xxxsen/common/logutil"
 	"go.uber.org/zap"
 )
 
@@ -204,12 +204,12 @@ func (r *dohResolver) recordTransportFailure(ctx context.Context, state *dohTran
 	state.retired.Store(true)
 	r.state.Store(next)
 	state.transport.CloseIdleConnections()
-	logutil.GetLogger(ctx).Warn(
+	querylog.Logger(ctx).Warn(
 		"replaced failed DoH transport generation",
-		zap.String("resolver", r.Name()),
+		zap.String("resolver", querylog.SafeText(r.Name())),
 		zap.Uint64("old_generation", state.generation),
 		zap.Uint64("new_generation", nextGeneration),
-		zap.Error(queryErr),
+		querylog.Error(queryErr),
 	)
 }
 
@@ -220,7 +220,7 @@ func (r *dohResolver) Query(ctx context.Context, req *dns.Msg) (*dns.Msg, error)
 	if req == nil {
 		return nil, fmt.Errorf("DoH resolver received a nil request")
 	}
-	logger := logutil.GetLogger(ctx).With(zap.String("resolver", r.Name()))
+	logger := querylog.Logger(ctx).With(zap.String("resolver", querylog.SafeText(r.Name())))
 	payload, err := req.Pack()
 	if err != nil {
 		return nil, fmt.Errorf("pack DNS request: %w", err)

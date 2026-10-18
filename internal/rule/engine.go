@@ -5,7 +5,7 @@ import (
 	"fmt"
 
 	"github.com/miekg/dns"
-	"github.com/xxxsen/common/logutil"
+	"github.com/xxxsen/atlas/internal/querylog"
 	"go.uber.org/zap"
 )
 
@@ -26,13 +26,13 @@ func (d *defaultEngine) Execute(ctx context.Context, req *dns.Msg) (*dns.Msg, er
 		if !ok {
 			continue
 		}
-		logutil.GetLogger(ctx).Debug("match rule", zap.String("rule_remark", r.Name()))
+		querylog.Logger(ctx).Debug("match rule", zap.String("rule_remark", r.Name()))
 		res, err := r.Perform(ctx, req)
 		if err != nil {
-			logutil.GetLogger(ctx).Debug("perform rule failed", zap.Error(err))
+			querylog.Logger(ctx).Debug("perform rule failed", querylog.Error(err))
 			return nil, err
 		}
-		logutil.GetLogger(ctx).Debug("perform rule succ")
+		querylog.Logger(ctx).Debug("perform rule succ", querylog.Fields(ctx)...)
 		return res, nil
 	}
 	return nil, fmt.Errorf("no rule match, may be you need a default rule?")

@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -17,6 +18,7 @@ import (
 	lru "github.com/hashicorp/golang-lru/v2"
 	"github.com/miekg/dns"
 	"github.com/xxxsen/atlas/internal/hosts"
+	"github.com/xxxsen/atlas/internal/querylog"
 	"github.com/xxxsen/atlas/internal/resolver"
 	"github.com/xxxsen/common/logutil"
 	"go.uber.org/zap"
@@ -53,6 +55,7 @@ type flight struct {
 	done chan struct{}
 	data candidate
 	err  error
+	id   string
 }
 
 // Manager owns authenticated discovery, per-domain versions, bounded caching,
@@ -162,6 +165,12 @@ func New(parent context.Context, config Config, options Options) (*Manager, erro
 		m.tasks.Add(1)
 		go m.persistLoop()
 	}
+	keyIDs := make([]string, 0, len(keys))
+	for id := range keys {
+		keyIDs = append(keyIDs, id)
+	}
+	slices.Sort(keyIDs)
+	querylog.Logger(ctx).Info("bootstrap initialized", zap.Int("domain_count", len(domains)), zap.Int("public_key_count", len(keys)), zap.Strings("public_key_ids", keyIDs), zap.Int("upstream_count", len(upstreams)))
 	return m, nil
 }
 
@@ -214,6 +223,8 @@ func (m *Manager) Resolve(ctx context.Context, req *dns.Msg) (*dns.Msg, bool, er
 	if ctx == nil {
 		return nil, true, fmt.Errorf("bootstrap context is nil")
 	}
+	ctx = querylog.WithQuery(ctx, req)
+	querylog.SetResult(ctx, querylog.Result{Source: "bootstrap", Action: "bootstrap"})
 	if req.Question[0].Qclass != dns.ClassINET {
 		msg := new(dns.Msg)
 		msg.SetRcode(req, dns.RcodeRefused)
@@ -234,14 +245,24 @@ func (m *Manager) Resolve(ctx context.Context, req *dns.Msg) (*dns.Msg, bool, er
 			// Signature validity is independent of DNS TTL and lazy max_stale.
 			if entry.record.validAt(now, m.config.skew()) == nil && now.Before(entry.stale) {
 				stale := !now.Before(entry.fresh)
+				refreshID := ""
 				if stale {
-					m.startFlightLocked(domain, ctx, true)
+					if work := m.startFlightLocked(domain, ctx, true); work != nil {
+						refreshID = work.id
+					}
 				}
 				m.mu.Unlock()
 				ttl := remainingTTL(entry.fresh, now)
 				if stale {
 					ttl = 0
 				}
+				status := "fresh"
+				if stale {
+					status = "stale"
+				}
+				querylog.SetCache(ctx, "bootstrap", status)
+				querylog.SetResult(ctx, bootstrapResult(entry.candidate))
+				querylog.Logger(ctx).Debug("bootstrap cache hit", append(querylog.Fields(ctx), zap.String("refresh_traceid", refreshID), zap.String("key_id", entry.record.KeyID), zap.Int64("issued_at", entry.record.IssuedAt), zap.Int64("expires_at", entry.record.ExpiresAt))...)
 				return response(req, entry.record, ttl), true, nil
 			}
 			m.removeCacheLocked(domain)
@@ -249,6 +270,9 @@ func (m *Manager) Resolve(ctx context.Context, req *dns.Msg) (*dns.Msg, bool, er
 	}
 	work := m.startFlightLocked(domain, ctx, false)
 	m.mu.Unlock()
+	querylog.SetCache(ctx, "bootstrap", "miss")
+	querylog.SetWork(ctx, work.id)
+	querylog.Logger(ctx).Debug("bootstrap query waiting", zap.String("upstream_traceid", work.id), zap.String("txt_domain", m.domains[domain]))
 	select {
 	case <-ctx.Done():
 		return nil, true, ctx.Err()
@@ -260,6 +284,7 @@ func (m *Manager) Resolve(ctx context.Context, req *dns.Msg) (*dns.Msg, bool, er
 		if err := work.data.record.validAt(now, m.config.skew()); err != nil {
 			return nil, true, err
 		}
+		querylog.SetResult(ctx, bootstrapResult(work.data))
 		return response(req, work.data.record, remainingTTL(work.data.fresh, now)), true, nil
 	}
 }
@@ -307,12 +332,14 @@ func (m *Manager) startFlightLocked(domain string, caller context.Context, backg
 		select {
 		case m.refreshSem <- struct{}{}:
 		default:
+			querylog.Logger(caller).Debug("bootstrap refresh skipped", zap.String("reason", "concurrency_limit"))
 			return nil
 		}
 	}
-	work := &flight{done: make(chan struct{})}
+	work := &flight{done: make(chan struct{}), id: querylog.NewID()}
 	m.flights[domain] = work
-	queryCtx, cancel := context.WithTimeout(m.ctx, time.Duration(m.config.RequestTimeout)*time.Second)
+	parent := querylog.Fork(m.ctx, caller, work.id, background)
+	queryCtx, cancel := context.WithTimeout(parent, time.Duration(m.config.RequestTimeout)*time.Second)
 	if !background {
 		if deadline, ok := caller.Deadline(); ok {
 			var deadlineCancel context.CancelFunc
@@ -328,8 +355,12 @@ func (m *Manager) startFlightLocked(domain string, caller context.Context, backg
 		if background {
 			defer func() { <-m.refreshSem }()
 		}
+		start := time.Now()
+		logger := querylog.Logger(queryCtx).With(zap.String("txt_domain", m.domains[domain]))
+		logger.Debug("bootstrap query started", zap.Int("upstream_count", len(m.upstreams)), zap.Int("parallel", m.config.Parallel), zap.Bool("wait_for_all", true))
 		selected, err := m.collect(queryCtx, domain)
 		m.mu.Lock()
+		previousVersion := m.versions[domain].Version
 		if err == nil && !m.closed {
 			err = m.acceptLocked(domain, selected)
 		} else if m.closed {
@@ -340,7 +371,18 @@ func (m *Manager) startFlightLocked(domain string, caller context.Context, backg
 		close(work.done)
 		m.mu.Unlock()
 		if err != nil {
-			logutil.GetLogger(m.ctx).Warn("bootstrap refresh failed", zap.String("domain", domain), zap.Error(err))
+			if queryCtx.Err() == context.Canceled && m.ctx.Err() != nil {
+				logger.Debug("bootstrap query stopped", querylog.Error(err), querylog.Elapsed(start))
+			} else {
+				logger.Warn("bootstrap query failed", querylog.Error(err), querylog.Elapsed(start), zap.String("candidate_resolver", querylog.SafeText(selected.source)), zap.Int64("previous_issued_at", previousVersion), zap.Int64("candidate_issued_at", selected.record.IssuedAt))
+			}
+		} else {
+			querylog.SetResult(queryCtx, bootstrapResult(selected))
+			addresses := append(append([]string(nil), selected.record.A...), selected.record.AAAA...)
+			if len(addresses) > 8 {
+				addresses = addresses[:8]
+			}
+			logger.Info("accepted signed bootstrap addresses", append(querylog.Fields(queryCtx), querylog.Elapsed(start), zap.Strings("ips", addresses), zap.String("key_id", selected.record.KeyID), zap.Int64("issued_at", selected.record.IssuedAt), zap.Int64("expires_at", selected.record.ExpiresAt))...)
 		}
 	}()
 	return work
@@ -383,10 +425,14 @@ func (m *Manager) acceptLocked(domain string, selected candidate) error {
 			m.cacheBytes += entry.size
 		}
 	}
-	logutil.GetLogger(m.ctx).Debug("accepted signed bootstrap addresses",
-		zap.String("domain", domain), zap.String("source", selected.source),
-		zap.Int64("issued_at", selected.record.IssuedAt), zap.Int64("expires_at", selected.record.ExpiresAt))
 	return nil
+}
+
+func bootstrapResult(value candidate) querylog.Result {
+	if value.source == "checkpoint" {
+		return querylog.Result{Source: "bootstrap_checkpoint", Resolver: "unknown", Action: "bootstrap"}
+	}
+	return querylog.Result{Source: "bootstrap", Resolver: querylog.SafeText(value.source), Action: "bootstrap"}
 }
 
 func (m *Manager) removeCacheLocked(domain string) {
@@ -434,13 +480,15 @@ func (m *Manager) collect(ctx context.Context, domain string) (candidate, error)
 			errs = append(errs, result.err)
 		}
 		for _, value := range result.candidates {
-			if value.record.validAt(m.now(), m.config.skew()) != nil {
+			if err := value.record.validAt(m.now(), m.config.skew()); err != nil {
+				querylog.Logger(ctx).Warn("bootstrap candidate lifetime invalid before selection", querylog.Error(err), zap.String("resolver", querylog.SafeText(value.source)), zap.Int64("issued_at", value.record.IssuedAt), zap.Int64("expires_at", value.record.ExpiresAt))
 				continue
 			}
 			if value.record.IssuedAt > selected.record.IssuedAt {
 				selected, conflict = value, false
 			} else if value.record.IssuedAt == selected.record.IssuedAt {
 				if value.record.digest() != selected.record.digest() {
+					querylog.Logger(ctx).Warn("bootstrap signed candidate conflict", zap.Int64("issued_at", value.record.IssuedAt), zap.String("resolver", querylog.SafeText(value.source)), zap.String("previous_resolver", querylog.SafeText(selected.source)))
 					conflict = true
 				} else if value.fresh.Before(selected.fresh) {
 					selected.fresh = value.fresh
@@ -449,7 +497,7 @@ func (m *Manager) collect(ctx context.Context, domain string) (candidate, error)
 		}
 	}
 	if conflict {
-		return candidate{}, fmt.Errorf("conflicting bootstrap records at the highest timestamp for %s", domain)
+		return candidate{}, fmt.Errorf("conflicting bootstrap records at the highest timestamp %d for %s", selected.record.IssuedAt, domain)
 	}
 	if selected.wire == "" {
 		return candidate{}, fmt.Errorf("no valid signed bootstrap result for %s: %w", domain, errors.Join(append(errs, ctx.Err())...))
@@ -457,7 +505,18 @@ func (m *Manager) collect(ctx context.Context, domain string) (candidate, error)
 	return selected, nil
 }
 
-func (m *Manager) queryUpstream(ctx context.Context, domain string, upstream resolver.IDNSResolver) ([]candidate, error) {
+func (m *Manager) queryUpstream(ctx context.Context, domain string, upstream resolver.IDNSResolver) (values []candidate, resultErr error) {
+	start := time.Now()
+	logger := querylog.Logger(ctx).With(zap.String("resolver", querylog.SafeText(upstream.Name())), zap.String("txt_domain", m.domains[domain]), zap.Uint16("upstream_qtype", dns.TypeTXT))
+	rejected := 0
+	defer func() {
+		fields := []zap.Field{querylog.Elapsed(start), zap.Int("valid_candidates", len(values)), zap.Int("rejected_candidates", rejected), querylog.Error(resultErr)}
+		if resultErr != nil {
+			logger.Warn("bootstrap upstream query failed", fields...)
+		} else {
+			logger.Debug("bootstrap upstream query completed", fields...)
+		}
+	}()
 	request := new(dns.Msg)
 	request.SetQuestion(dns.Fqdn(m.domains[domain]), dns.TypeTXT)
 	request.SetEdns0(1232, false)
@@ -469,9 +528,8 @@ func (m *Manager) queryUpstream(ctx context.Context, domain string, upstream res
 		return nil, fmt.Errorf("%s: %w", upstream.Name(), err)
 	}
 	if msg.Truncated || msg.Rcode != dns.RcodeSuccess {
-		return nil, fmt.Errorf("%s: no complete successful TXT response", upstream.Name())
+		return nil, fmt.Errorf("%s: no complete successful TXT response (rcode=%s, truncated=%t)", upstream.Name(), dns.RcodeToString[msg.Rcode], msg.Truncated)
 	}
-	var values []candidate
 	var lastErr error
 	count := 0
 	for _, rr := range msg.Answer {
@@ -495,11 +553,18 @@ func (m *Manager) queryUpstream(ctx context.Context, domain string, upstream res
 		record, err := Verify(wire, domain, m.keys, now, m.config.skew())
 		if err != nil {
 			lastErr = err
+			rejected++
+			fields := []zap.Field{zap.Int("txt_index", count), querylog.Error(err)}
+			if id, decodeErr := hex.DecodeString(record.KeyID); decodeErr == nil && len(id) == 32 {
+				fields = append(fields, zap.String("candidate_key_id", record.KeyID))
+			}
+			logger.Warn("bootstrap TXT candidate rejected", fields...)
 			continue
 		}
 		ttl := min(int64(txt.Hdr.Ttl), m.config.TTLMax, (record.ExpiresAt-now.UnixMilli())/1000)
 		values = append(values, candidate{record: record, wire: wire,
 			fresh: now.Add(time.Duration(ttl) * time.Second), source: upstream.Name()})
+		logger.Debug("bootstrap TXT candidate verified", zap.Int("txt_index", count), zap.String("key_id", record.KeyID), zap.Int64("issued_at", record.IssuedAt), zap.Int64("expires_at", record.ExpiresAt))
 	}
 	if len(values) == 0 {
 		if lastErr == nil {

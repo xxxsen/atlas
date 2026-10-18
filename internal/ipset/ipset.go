@@ -32,6 +32,17 @@ type Registry struct {
 	sets map[string]*prefixSet
 }
 
+// Count reports the number of canonical CIDRs loaded into a named set.
+func (r *Registry) Count(name string) int {
+	if r == nil {
+		return 0
+	}
+	if set := r.sets[strings.TrimSpace(name)]; set != nil {
+		return len(set.prefixes)
+	}
+	return 0
+}
+
 // Validator accepts an address if any configured set or network contains it.
 // It is immutable and safe to share between queries.
 type Validator struct {

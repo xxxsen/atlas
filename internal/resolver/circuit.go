@@ -10,7 +10,7 @@ import (
 	"time"
 
 	"github.com/miekg/dns"
-	"github.com/xxxsen/common/logutil"
+	"github.com/xxxsen/atlas/internal/querylog"
 	"go.uber.org/zap"
 )
 
@@ -320,7 +320,7 @@ func (r *circuitBreakerResolver) resolverHealth() upstreamHealth {
 }
 
 func (r *circuitBreakerResolver) logTransition(ctx context.Context, transition circuitTransition) {
-	logger := logutil.GetLogger(ctx).With(zap.String("upstream", r.Name()))
+	logger := querylog.Logger(ctx).With(zap.String("upstream", querylog.SafeText(r.Name())))
 	switch transition.state {
 	case circuitOpen:
 		logger.Warn("upstream circuit opened", zap.Int("consecutive_failures", transition.failures), zap.Duration("retry_after", transition.retryAfter))

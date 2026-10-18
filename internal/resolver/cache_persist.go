@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/miekg/dns"
+	"github.com/xxxsen/atlas/internal/querylog"
 )
 
 const cachePersistenceVersion = 2
@@ -29,11 +30,12 @@ type persistKey struct {
 }
 
 type persistRecord struct {
-	Key        persistKey `json:"key"`
-	StoredAt   int64      `json:"stored_at"`
-	Expire     int64      `json:"expire"`
-	StaleUntil int64      `json:"stale_until"`
-	Msg        []byte     `json:"msg"`
+	Key        persistKey       `json:"key"`
+	StoredAt   int64            `json:"stored_at"`
+	Expire     int64            `json:"expire"`
+	StaleUntil int64            `json:"stale_until"`
+	Msg        []byte           `json:"msg"`
+	Result     *querylog.Result `json:"result,omitempty"`
 }
 
 func (c *CacheManager) persist() error {
@@ -107,6 +109,11 @@ func (c *CacheManager) snapshot() []persistRecord {
 			if now.After(entry.staleUntil) {
 				continue
 			}
+			var result *querylog.Result
+			if entry.result != (querylog.Result{}) {
+				copy := entry.result
+				result = &copy
+			}
 			records = append(records, persistRecord{
 				Key: persistKey{
 					Namespace: entry.key.Namespace,
@@ -120,6 +127,7 @@ func (c *CacheManager) snapshot() []persistRecord {
 				Expire:     entry.expire.UnixMilli(),
 				StaleUntil: entry.staleUntil.UnixMilli(),
 				Msg:        entry.data,
+				Result:     result,
 			})
 		}
 		shard.mu.Unlock()
@@ -233,6 +241,9 @@ func (c *CacheManager) decodePersistRecord(record persistRecord, now time.Time) 
 		storedAt:   storedAt,
 		expire:     expire,
 		staleUntil: staleUntil,
+	}
+	if record.Result != nil {
+		entry.result = record.Result.Sanitized()
 	}
 	entry.size = cacheEntrySize(entry)
 	return entry, nil
