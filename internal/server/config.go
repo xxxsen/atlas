@@ -1,8 +1,10 @@
 package server
 
 import (
+	"context"
 	"time"
 
+	"github.com/miekg/dns"
 	"github.com/xxxsen/atlas/internal/hosts"
 	"github.com/xxxsen/atlas/internal/rule"
 )
@@ -10,10 +12,16 @@ import (
 // Option configures the DNS server.
 type Option func(*options)
 
+// BootstrapResolver must claim configured names even when verification fails.
+type BootstrapResolver interface {
+	Resolve(context.Context, *dns.Msg) (*dns.Msg, bool, error)
+}
+
 type options struct {
 	bind               string
 	re                 rule.IDNSRuleEngine
 	hosts              hosts.IHostResolver
+	bootstrap          BootstrapResolver
 	udpSize            int
 	maxResponseUDPSize int
 	maxInflight        int
@@ -23,6 +31,10 @@ type options struct {
 	rateLimitClients   int
 	ready              func()
 	allowedCIDRs       []string
+}
+
+func WithBootstrapResolver(value BootstrapResolver) Option {
+	return func(o *options) { o.bootstrap = value }
 }
 
 // WithAllowedCIDRs restricts clients to the supplied IP prefixes. An empty

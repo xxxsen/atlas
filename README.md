@@ -1,12 +1,12 @@
 # Atlas DNS 转发器
 
-Atlas 是一个由 matcher、rule 和 action 组合驱动的 DNS 转发服务。它支持 UDP/TCP、DNS over TLS、DNS over HTTPS、静态 hosts、geosite 分流、策略级缓存，以及有界的并发故障转移。
+Atlas 是一个由 matcher、rule 和 action 组合驱动的 DNS 转发服务。它支持 UDP/TCP、DNS over TLS、DNS over HTTPS、静态 hosts、geosite 分流、策略级缓存、有界的并发故障转移，以及通过签名 TXT 保护代理入口的 bootstrap 解析。
 
 默认配置行为偏向安全：DNS 监听地址为 `127.0.0.1:5353`，pprof 为 `127.0.0.1:6060`。如需对外提供递归解析，必须显式修改监听地址，并配合网络 ACL、防火墙和客户端限速。
 
 ## 本地开发
 
-项目提供统一的 Makefile 入口。没有系统 Go 时，脚本会在仓库 `.cache/go-runtime` 安装校验过 SHA-256 的 Go 1.26.6，不修改系统环境。
+项目提供统一的 Makefile 入口。没有系统 Go 时，脚本会在仓库 `.cache/go-runtime` 安装校验过 SHA-256 的 Go 1.26.9，不修改系统环境。
 
 ```bash
 make build       # 构建 bin/atlas
@@ -133,6 +133,88 @@ log:
   console: true
 ```
 
+## 签名 TXT bootstrap
+
+对于 IP 固定、偶尔手动迁移的代理入口，可以将地址与有效期签名后发布为 TXT。Atlas 使用本地公钥验签，再合成 A/AAAA 响应。即使查询 TXT 的解析器返回被修改的地址，也无法生成有效签名；解析器仍可能拒绝响应或回放此前签名的数据。
+
+### 配置与域名文件
+
+`bootstrap` 是可选的顶层配置。所有域名共用 `public_keys`，不配置 `records`：
+
+```yaml
+bootstrap:
+  server_list:
+    - https://223.5.5.5/dns-query
+    - https://1.12.12.12/dns-query
+  parallel: 2              # 默认 min(3, 上游数量)
+  request_timeout: 3       # 一次完整查询的总超时，秒
+  ttl_max: 300             # 本地地址缓存 TTL 上限，秒
+  clock_skew: 30           # issued_at 允许超前的秒数，可设为 0；不延长过期时间
+  files:
+    - /config/bootstrap-domains.txt
+    - /config/bootstrap-extra.txt
+  public_keys:
+    - /config/bootstrap.pub
+```
+
+`files` 中每个路径指向一个文本文件，内容一行一条 `域名[:TXT 查询域名]`：
+
+```text
+# /config/bootstrap-domains.txt
+proxy.example.test
+local.example.test:_atlas.local.example.test
+
+# 省略冒号后的名称时默认查询 _atlas.<原域名>
+another.example.test:
+```
+
+文件支持空行、行尾注释、大小写和末尾点规范化；相同映射可重复，不同文件对同一域名配置不同 TXT 名称会在启动时报出文件与行号。文件在启动时加载，修改后重启生效。这里使用完整域名匹配，不包含子域名。同一域名同时出现在 bootstrap 和 hosts 中会阻止启动。
+
+bootstrap 在 hosts 和普通规则之前处理，因此无需为这些域名额外编写 matcher/action。内部 TXT 查询直接访问 `server_list`，不会重新进入普通规则；上游地址应能在代理尚未建立时访问，例如上面的 IP 形式 DoH 地址。其余域名继续按普通规则处理，可以将最终 `match: any` 指向境外解析器。
+
+### 生成密钥、签名与发布
+
+命令行使用 Cobra，下面的离线命令不加载服务配置，也不自动修改 DNS：
+
+```bash
+./bin/atlas bootstrap keygen \
+  --private-key /config/bootstrap.key \
+  --public-key /config/bootstrap.pub
+
+./bin/atlas bootstrap sign \
+  --private-key /config/bootstrap.key \
+  --domain proxy.example.test \
+  --a 192.0.2.10 \
+  --aaaa 2001:db8::10 \
+  --expires-at 1893456000000
+```
+
+`keygen` 生成 Ed25519 PKCS#8 私钥与 PKIX 公钥 PEM 文件，拒绝覆盖已有文件；私钥权限为 `0600`。服务启动只读取公钥。`--a`、`--aaaa` 均可重复，允许只提供其中一个地址族，至少需要一个地址。
+
+`--expires-at` 必须是 **Unix 毫秒时间戳整数**，与时区无关，必须晚于当前签名时间。有效期长度不设上限。`issued_at` 自动使用当前 Unix 毫秒时间戳，并作为版本号；修改记录时需要生成更大的时间戳。工具不提供自动续期。
+
+`sign` 标准输出只有完整 TXT 值：`atlas1.<Base64url JSON>.<Base64url 签名>`。手动将该值发布到 `_atlas.proxy.example.test` 的**同一条 TXT 记录**。DNS 面板需要拆分长文本时，每段最多 255 字节，并保持为同一个 RR 内的多个字符串；不能拆成多条 TXT 记录。可以用下面的命令在发布前验签：
+
+```bash
+./bin/atlas bootstrap verify \
+  --public-key /config/bootstrap.pub \
+  --domain proxy.example.test \
+  --record 'atlas1.<完整负载>.<完整签名>'
+
+./bin/atlas bootstrap sign --help
+```
+
+签名覆盖固定前缀 `atlas1\0` 和原始 JSON 字节。JSON 包含 `kid`、`domain`、`issued_at`、`expires_at`、可选的 `a`/`aaaa`；`kid` 是公钥原始字节的 SHA-256 十六进制值。验签拒绝未知版本、未知公钥、跨域名使用、签名不匹配、重复或未知 JSON 字段、无效地址、超前时间和已过期记录。密钥轮换时可在 `public_keys` 暂时同时配置新旧公钥，手动完成重新签名、发布和重启。
+
+### 查询、失败与缓存行为
+
+- 每个域名的 A/AAAA 共享一次 TXT 查询和同一份签名地址集。缺少某个地址族时返回 NODATA，不向其他解析器补全。ANY 返回已签名的两个地址族；对原域名的 CNAME、TXT、HTTPS、SVCB 等其他类型返回空的 NOERROR。
+- 至多并发 `parallel` 个上游，等待全部完成或总超时后，从已验签结果中选择时间戳最大的记录。单个上游失败不影响其余有效结果。同一时间戳出现不同签名内容时拒绝更新。
+- 已接受的版本在当前进程内不会回退，缓存淘汰和地址过期也不会删除版本水位。同版本同内容可再次接受。首次启动、未持久化或丢弃了检查点时，仍可能接受尚未过期的历史签名。
+- 保留现有 `cache.lazy/max_stale` 乐观缓存：DNS TTL 到期后可以立即返回 TTL 为 0 的已验签地址，并在后台刷新。刷新失败保留仍有效的旧缓存；超过 `max_stale` 或签名 `expires_at` 后停止返回。没有有效地址时返回 SERVFAIL，不回退到 hosts 或普通 DNS。
+- 新鲜 TTL 取 TXT TTL、`ttl_max`、签名剩余有效期三者的最小值。bootstrap 缓存沿用 `cache.size/max_bytes/max_entry_bytes/refresh_concurrency` 参数，与普通 DNS 缓存分别计数；`cache.size: 0` 同时关闭地址缓存，但进程内版本水位仍保留。
+- 开启 `cache.persist` 后，bootstrap 使用 `cache.file` 加 `.bootstrap` 后缀的独立检查点，沿用 `cache.interval` 周期落盘和关停落盘，采用临时文件、`fsync`、原子替换。恢复时按当前配置、公钥和绝对有效期重新验签，不续 TTL。检查点损坏或配置不匹配会丢弃重建。崩溃可能丢失尚未落盘的新版本水位，符合普通缓存的持久化时机。
+
 ## 请求链路与资源边界
 
 Atlas 的核心处理顺序为：
@@ -140,6 +222,7 @@ Atlas 的核心处理顺序为：
 ```text
 UDP/TCP listener
   -> 协议校验、全局并发和按客户端限速
+  -> 签名 TXT bootstrap（配置的完整域名）
   -> hosts
   -> matcher expression / rule
   -> 策略命名空间缓存
@@ -150,7 +233,7 @@ UDP/TCP listener
 ```
 
 - 同一请求交给多个上游前会逐一复制 `dns.Msg`，不会并发共享可变 EDNS 数据。
-- 解析组维持至多 `parallel` 个在途查询；失败或 SERVFAIL/REFUSED 等无效结果会由剩余上游补位，首个有效响应成为唯一结果。
+- 普通解析组维持至多 `parallel` 个在途查询；失败或 SERVFAIL/REFUSED 等无效结果会由剩余上游补位，首个有效响应成为唯一结果。bootstrap 则等待结果汇总并选择最新有效版本。
 - 每个 resolver 还有独立 `max_inflight` 上限。TCP/DoT 使用独占、有界连接池；UDP 收到 `TC=1` 会自动用 TCP 重试；DoH 显式启用 HTTP/2、PING 健康检查和故障连接代际重建，并限制连接数和响应体为 65535 字节。
 - 入站 UDP 无 EDNS 时按 512 字节响应；有 EDNS 时采用客户端声明值，但不超过 `max_response_udp_size`。TCP 响应不截断。
 

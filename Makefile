@@ -1,7 +1,7 @@
 # Atlas build, verification, and local development entry points.
 
 BIN ?= atlas
-GO_VERSION ?= 1.26.6
+GO_VERSION ?= 1.26.9
 
 PROJECT_ROOT := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
 GO ?= $(PROJECT_ROOT)/.cache/go-runtime/bin/go
