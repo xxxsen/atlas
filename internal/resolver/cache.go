@@ -2,6 +2,7 @@ package resolver
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -10,6 +11,10 @@ import (
 
 	lru "github.com/hashicorp/golang-lru/v2"
 	"github.com/miekg/dns"
+	"github.com/xxxsen/atlas/internal/querylog"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
+	"go.uber.org/zap"
 )
 
 const (
@@ -68,7 +73,7 @@ type CacheManager struct {
 	flights  map[cacheKey]*cacheFlight
 
 	refreshMu  sync.Mutex
-	refreshing map[cacheKey]struct{}
+	refreshing map[cacheKey]trace.SpanContext
 	refreshSem chan struct{}
 
 	lifecycleMu  sync.Mutex
@@ -95,6 +100,7 @@ type cacheEntry struct {
 	expire     time.Time
 	staleUntil time.Time
 	size       int64
+	result     querylog.Result
 }
 
 type cacheKey struct {
@@ -117,6 +123,9 @@ type cacheFlight struct {
 	done chan struct{}
 	msg  *dns.Msg
 	err  error
+	ctx  context.Context
+	span trace.Span
+	info querylog.Snapshot
 }
 
 type cacheResolver struct {
@@ -144,7 +153,7 @@ func NewCacheManager(parent context.Context, cfg CacheOptions) (*CacheManager, e
 		ctx:          ctx,
 		cancel:       cancel,
 		flights:      make(map[cacheKey]*cacheFlight),
-		refreshing:   make(map[cacheKey]struct{}),
+		refreshing:   make(map[cacheKey]trace.SpanContext),
 		refreshSem:   make(chan struct{}, cfg.RefreshConcurrency),
 		stopPersist:  make(chan struct{}),
 		shutdownDone: make(chan struct{}),
@@ -289,7 +298,7 @@ func (c *cacheResolver) Close() error {
 	return nil
 }
 
-func (c *CacheManager) Query(ctx context.Context, namespace string, resolver IDNSResolver, req *dns.Msg) (*dns.Msg, error) {
+func (c *CacheManager) Query(ctx context.Context, namespace string, resolver IDNSResolver, req *dns.Msg) (response *dns.Msg, resultErr error) {
 	if ctx == nil {
 		return nil, fmt.Errorf("cache query context is nil")
 	}
@@ -309,9 +318,16 @@ func (c *CacheManager) Query(ctx context.Context, namespace string, resolver IDN
 	if c.isClosed() {
 		return nil, context.Canceled
 	}
+	ctx = querylog.WithQuery(ctx, req)
+	ctx, cancel := WithQueryBudget(ctx, c.cfg.QueryTimeout)
+	defer cancel()
+	ctx, span := querylog.Start(ctx, "cache.query", trace.WithAttributes(attribute.String("atlas.cache.namespace", namespace)))
+	defer func() { querylog.Finish(ctx, span, resultErr) }()
 	key, cacheable := buildCacheKey(namespace, req)
 	if !cacheable {
 		c.bypasses.Add(1)
+		querylog.SetCache(ctx, namespace, "bypass")
+		querylog.Logger(ctx).Debug("DNS cache bypassed", zap.String("namespace", namespace))
 		resp, err := resolver.Query(ctx, req)
 		if err == nil {
 			err = ValidateResponse(req, resp)
@@ -319,18 +335,28 @@ func (c *CacheManager) Query(ctx context.Context, namespace string, resolver IDN
 		return resp, err
 	}
 
-	msg, state, found := c.get(key)
+	msg, state, found, result := c.get(key)
 	if found {
+		if result.Source == "" {
+			result = querylog.Result{Source: "cache", Resolver: "unknown", Action: namespace}
+		}
+		querylog.SetResult(ctx, result)
 		if state == cacheFresh {
 			c.hits.Add(1)
+			querylog.SetCache(ctx, namespace, "fresh")
+			if checked := querylog.Logger(ctx).Check(zap.DebugLevel, "DNS cache hit"); checked != nil {
+				checked.Write(querylog.Fields(ctx)...)
+			}
 			return prepareCachedResponse(msg, req), nil
 		}
 		c.staleHits.Add(1)
-		c.scheduleRefresh(key, resolver, req.Copy())
+		querylog.SetCache(ctx, namespace, "stale")
+		refresh := c.scheduleRefresh(ctx, key, resolver, req.Copy())
+		querylog.Logger(ctx).Debug("DNS stale cache hit", append(querylog.Fields(ctx), querylog.WorkFields("refresh", refresh)...)...)
 		return prepareCachedResponse(msg, req), nil
 	}
 
-	c.misses.Add(1)
+	querylog.SetCache(ctx, namespace, "miss")
 	return c.queryFlight(ctx, key, resolver, req)
 }
 
@@ -341,59 +367,91 @@ const (
 	cacheStale
 )
 
-func (c *CacheManager) get(key cacheKey) (*dns.Msg, cacheState, bool) {
+func (c *CacheManager) get(key cacheKey) (*dns.Msg, cacheState, bool, querylog.Result) {
 	shard := c.shard(key)
 	now := time.Now()
 	shard.mu.Lock()
 	entry, ok := shard.cache.Get(key)
 	if !ok {
 		shard.mu.Unlock()
-		return nil, cacheFresh, false
+		return nil, cacheFresh, false, querylog.Result{}
 	}
 	if now.After(entry.staleUntil) {
 		shard.cache.Remove(key)
 		shard.mu.Unlock()
 		c.generation.Add(1)
-		return nil, cacheFresh, false
+		return nil, cacheFresh, false, querylog.Result{}
 	}
 	data := entry.data
 	storedAt := entry.storedAt
 	expire := entry.expire
+	result := entry.result
 	shard.mu.Unlock()
 
 	msg := new(dns.Msg)
 	if err := msg.Unpack(data); err != nil {
 		c.remove(key)
-		return nil, cacheFresh, false
+		return nil, cacheFresh, false, querylog.Result{}
 	}
 	if now.After(expire) {
 		adjustMessageTTL(msg, 0, true)
-		return msg, cacheStale, true
+		return msg, cacheStale, true, result
 	}
 	elapsed := uint64(now.Sub(storedAt) / time.Second)
 	adjustMessageTTL(msg, elapsed, false)
-	return msg, cacheFresh, true
+	return msg, cacheFresh, true, result
 }
 
-func (c *CacheManager) queryFlight(ctx context.Context, key cacheKey, resolver IDNSResolver, req *dns.Msg) (*dns.Msg, error) {
+func (c *CacheManager) queryFlight(ctx context.Context, key cacheKey, resolver IDNSResolver, req *dns.Msg) (response *dns.Msg, resultErr error) {
 	c.flightMu.Lock()
 	flight, ok := c.flights[key]
 	if !ok {
-		flight = &cacheFlight{done: make(chan struct{})}
+		// A previous flight may have stored its response and left the map
+		// since the first cache lookup. Recheck before starting new work.
+		if msg, state, found, result := c.get(key); found && state == cacheFresh {
+			c.flightMu.Unlock()
+			if result.Source == "" {
+				result = querylog.Result{Source: "cache", Resolver: "unknown", Action: key.Namespace}
+			}
+			querylog.SetResult(ctx, result)
+			querylog.SetCache(ctx, key.Namespace, "fresh")
+			c.hits.Add(1)
+			if checked := querylog.Logger(ctx).Check(zap.DebugLevel, "DNS cache hit"); checked != nil {
+				checked.Write(append(querylog.Fields(ctx), zap.String("reason", "filled_while_waiting"))...)
+			}
+			return prepareCachedResponse(msg, req), nil
+		}
+		workCtx, workSpan := querylog.Fork(c.ctx, ctx, "cache.upstream", false)
+		flight = &cacheFlight{done: make(chan struct{}), ctx: workCtx, span: workSpan}
 		c.flights[key] = flight
 		request := req.Copy()
-		if !c.startTask(func() { c.runFlight(key, resolver, request, flight) }) {
+		// The waiter below starts its own span and replaces ctx. Capture the
+		// source context now so the worker never reads that mutable variable.
+		source := ctx
+		if !c.startTask(func() { c.runFlight(source, key, resolver, request, flight) }) {
 			delete(c.flights, key)
 			flight.err = context.Canceled
+			querylog.Finish(workCtx, workSpan, flight.err)
 			close(flight.done)
 		}
 	}
+	c.misses.Add(1)
 	c.flightMu.Unlock()
+	sc := flight.span.SpanContext()
+	querylog.SetWork(ctx, sc)
+	ctx, span := querylog.Start(ctx, "cache.wait", trace.WithLinks(trace.Link{SpanContext: sc}))
+	defer func() { querylog.Finish(ctx, span, resultErr) }()
+	start := time.Now()
+	logger := querylog.Logger(ctx).With(append(querylog.WorkFields("work", sc), zap.String("namespace", key.Namespace), zap.Bool("shared", ok))...)
+	logger.Debug("DNS cache query waiting")
 
 	select {
 	case <-ctx.Done():
+		logger.Debug("DNS cache query waiter stopped", querylog.Error(ctx.Err()), querylog.Elapsed(start))
 		return nil, ctx.Err()
 	case <-flight.done:
+		querylog.Apply(ctx, flight.info.Result, flight.info.FallbackExecuted)
+		logger.Debug("DNS cache query completed", append(querylog.Fields(ctx), querylog.Error(flight.err), querylog.Elapsed(start))...)
 		if flight.err != nil {
 			return nil, flight.err
 		}
@@ -401,39 +459,45 @@ func (c *CacheManager) queryFlight(ctx context.Context, key cacheKey, resolver I
 	}
 }
 
-func (c *CacheManager) runFlight(key cacheKey, resolver IDNSResolver, req *dns.Msg, flight *cacheFlight) {
-	queryCtx, cancel := context.WithTimeout(c.ctx, c.cfg.QueryTimeout)
+func (c *CacheManager) runFlight(source context.Context, key cacheKey, resolver IDNSResolver, req *dns.Msg, flight *cacheFlight) {
+	queryCtx, cancel := cacheQueryContext(flight.ctx, source, c.cfg.QueryTimeout)
 	defer cancel()
+	var err error
+	defer func() { querylog.Finish(queryCtx, flight.span, err) }()
 	msg, err := resolver.Query(queryCtx, req)
 	if err == nil {
 		err = ValidateResponse(req, msg)
 	}
 	if err == nil {
-		c.store(key, msg)
+		c.store(key, msg, querylog.Read(queryCtx).Result)
 		msg = msg.Copy()
 	}
 
 	c.flightMu.Lock()
 	flight.msg = msg
 	flight.err = err
+	flight.info = querylog.Read(queryCtx)
 	delete(c.flights, key)
 	close(flight.done)
 	c.flightMu.Unlock()
 }
 
-func (c *CacheManager) scheduleRefresh(key cacheKey, resolver IDNSResolver, req *dns.Msg) {
+func (c *CacheManager) scheduleRefresh(source context.Context, key cacheKey, resolver IDNSResolver, req *dns.Msg) trace.SpanContext {
 	c.refreshMu.Lock()
-	if _, exists := c.refreshing[key]; exists {
+	if id, exists := c.refreshing[key]; exists {
 		c.refreshMu.Unlock()
-		return
+		return id
 	}
 	select {
 	case c.refreshSem <- struct{}{}:
-		c.refreshing[key] = struct{}{}
 	default:
 		c.refreshMu.Unlock()
-		return
+		querylog.Logger(source).Debug("DNS cache refresh skipped", zap.String("namespace", key.Namespace), zap.String("reason", "concurrency_limit"))
+		return trace.SpanContext{}
 	}
+	workCtx, workSpan := querylog.Fork(c.ctx, source, "cache.refresh", true)
+	sc := workSpan.SpanContext()
+	c.refreshing[key] = sc
 	c.refreshMu.Unlock()
 
 	if !c.startTask(func() {
@@ -444,24 +508,39 @@ func (c *CacheManager) scheduleRefresh(key cacheKey, resolver IDNSResolver, req 
 			c.refreshMu.Unlock()
 		}()
 		c.refreshes.Add(1)
-		ctx, cancel := context.WithTimeout(c.ctx, c.cfg.QueryTimeout)
+		ctx, cancel := cacheQueryContext(workCtx, source, c.cfg.QueryTimeout)
 		defer cancel()
+		var err error
+		defer func() { querylog.Finish(ctx, workSpan, err) }()
+		start := time.Now()
+		logger := querylog.Logger(ctx).With(zap.String("namespace", key.Namespace))
+		logger.Debug("DNS cache refresh started")
 		msg, err := resolver.Query(ctx, req)
 		if err == nil {
 			err = ValidateResponse(req, msg)
 		}
 		if err == nil {
-			c.store(key, msg)
+			stored := c.store(key, msg, querylog.Read(ctx).Result)
+			logger.Debug("DNS cache refresh completed", append(querylog.Fields(ctx), querylog.Elapsed(start), zap.Bool("stored", stored))...)
+		} else {
+			if errors.Is(err, context.Canceled) && c.ctx.Err() != nil {
+				logger.Debug("DNS cache refresh stopped", querylog.Error(err), querylog.Elapsed(start))
+			} else {
+				logger.Warn("DNS cache refresh failed", querylog.Error(err), querylog.Elapsed(start))
+			}
 		}
 	}) {
 		<-c.refreshSem
 		c.refreshMu.Lock()
 		delete(c.refreshing, key)
 		c.refreshMu.Unlock()
+		querylog.Finish(workCtx, workSpan, context.Canceled)
+		return trace.SpanContext{}
 	}
+	return sc
 }
 
-func (c *CacheManager) store(key cacheKey, msg *dns.Msg) bool {
+func (c *CacheManager) store(key cacheKey, msg *dns.Msg, provenance ...querylog.Result) bool {
 	if c.isClosed() || !cacheableResponse(msg) {
 		return false
 	}
@@ -499,6 +578,9 @@ func (c *CacheManager) store(key cacheKey, msg *dns.Msg) bool {
 		storedAt:   now,
 		expire:     expire,
 		staleUntil: staleUntil,
+	}
+	if len(provenance) > 0 {
+		entry.result = provenance[0].Sanitized()
 	}
 	entry.size = cacheEntrySize(entry)
 	if !c.addEntry(entry) {
@@ -667,8 +749,8 @@ func prepareCachedResponse(msg, req *dns.Msg) *dns.Msg {
 }
 
 func cacheEntrySize(entry *cacheEntry) int64 {
-	const metadataOverhead = int64(160)
-	return int64(len(entry.data)+len(entry.key.Namespace)+len(entry.key.Name)) + metadataOverhead
+	const metadataOverhead = int64(216)
+	return int64(len(entry.data)+len(entry.key.Namespace)+len(entry.key.Name)+len(entry.result.Source)+len(entry.result.Action)+len(entry.result.Resolver)) + metadataOverhead
 }
 
 func (c *CacheManager) addEntry(entry *cacheEntry) bool {

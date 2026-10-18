@@ -5,7 +5,8 @@ import (
 	"fmt"
 
 	"github.com/miekg/dns"
-	"github.com/xxxsen/common/logutil"
+	"github.com/xxxsen/atlas/internal/querylog"
+	"go.opentelemetry.io/otel/attribute"
 	"go.uber.org/zap"
 )
 
@@ -17,7 +18,10 @@ type defaultEngine struct {
 	rules []IDNSRule
 }
 
-func (d *defaultEngine) Execute(ctx context.Context, req *dns.Msg) (*dns.Msg, error) {
+func (d *defaultEngine) Execute(ctx context.Context, req *dns.Msg) (response *dns.Msg, resultErr error) {
+	ctx = querylog.WithQuery(ctx, req)
+	ctx, span := querylog.Start(ctx, "rule.execute")
+	defer func() { querylog.Finish(ctx, span, resultErr) }()
 	for _, r := range d.rules {
 		ok, err := r.Match(ctx, req)
 		if err != nil {
@@ -26,13 +30,14 @@ func (d *defaultEngine) Execute(ctx context.Context, req *dns.Msg) (*dns.Msg, er
 		if !ok {
 			continue
 		}
-		logutil.GetLogger(ctx).Debug("match rule", zap.String("rule_remark", r.Name()))
+		span.SetAttributes(attribute.String("atlas.rule", querylog.SafeText(r.Name())))
+		querylog.Logger(ctx).Debug("match rule", zap.String("rule_remark", r.Name()))
 		res, err := r.Perform(ctx, req)
 		if err != nil {
-			logutil.GetLogger(ctx).Debug("perform rule failed", zap.Error(err))
+			querylog.Logger(ctx).Debug("perform rule failed", querylog.Error(err))
 			return nil, err
 		}
-		logutil.GetLogger(ctx).Debug("perform rule succ")
+		querylog.Logger(ctx).Debug("perform rule succ", querylog.Fields(ctx)...)
 		return res, nil
 	}
 	return nil, fmt.Errorf("no rule match, may be you need a default rule?")

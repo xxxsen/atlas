@@ -16,6 +16,7 @@ import (
 	"unicode"
 
 	"github.com/xxxsen/atlas/internal/bootstrap"
+	"github.com/xxxsen/atlas/internal/ipset"
 	"github.com/xxxsen/common/logger"
 	"gopkg.in/yaml.v3"
 )
@@ -88,6 +89,7 @@ type Resource struct {
 	Host    HostConfig      `json:"host" yaml:"host"`
 	Matcher []MatcherConfig `json:"matcher" yaml:"matcher"`
 	Action  []ActionConfig  `json:"action" yaml:"action"`
+	IPSet   []ipset.Config  `json:"ip_set,omitempty" yaml:"ip_set"`
 }
 
 // Load reads the configuration file from disk.
@@ -197,6 +199,9 @@ func defaultCacheBytes(entries int64) int64 {
 
 func (c *Config) Validate() error {
 	var errs []error
+	if err := ipset.Validate(c.Resource.IPSet); err != nil {
+		errs = append(errs, err)
+	}
 	if c.Bootstrap != nil {
 		if err := c.Bootstrap.Validate(); err != nil {
 			errs = append(errs, err)
@@ -383,15 +388,52 @@ func errorsJoin(errs []error) error {
 }
 
 func (c *Config) Fingerprint() (string, error) {
+	resource, err := c.cacheResource()
+	if err != nil {
+		return "", fmt.Errorf("encode configuration fingerprint: %w", err)
+	}
 	data, err := json.Marshal(struct {
 		Resource  Resource          `json:"resource"`
 		Rule      []Rule            `json:"rule"`
 		Cache     CacheConfig       `json:"cache"`
 		Bootstrap *bootstrap.Config `json:"bootstrap,omitempty"`
-	}{Resource: c.Resource, Rule: c.Rule, Cache: c.Cache, Bootstrap: c.Bootstrap})
+	}{Resource: resource, Rule: c.Rule, Cache: c.Cache, Bootstrap: c.Bootstrap})
 	if err != nil {
 		return "", fmt.Errorf("encode configuration fingerprint: %w", err)
 	}
 	sum := sha256.Sum256(data)
 	return hex.EncodeToString(sum[:]), nil
+}
+
+// Address validation applies to new responses only. Keep the legacy cache
+// fingerprint when these settings change; operators explicitly clear existing
+// cache files if they want a policy change to take effect on cached answers.
+func (c *Config) cacheResource() (Resource, error) {
+	resource := c.Resource
+	resource.IPSet = nil
+	if resource.Action != nil {
+		resource.Action = make([]ActionConfig, len(c.Resource.Action))
+		copy(resource.Action, c.Resource.Action)
+	}
+	for i, item := range resource.Action {
+		if !strings.EqualFold(strings.TrimSpace(item.Type), "forward") {
+			continue
+		}
+		data, err := json.Marshal(item.Data)
+		if err != nil {
+			return Resource{}, err
+		}
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(data, &fields); err != nil {
+			return Resource{}, err
+		}
+		_, validate := fields["validate"]
+		_, fallback := fields["fallback"]
+		if validate || fallback {
+			delete(fields, "validate")
+			delete(fields, "fallback")
+			resource.Action[i].Data = fields
+		}
+	}
+	return resource, nil
 }

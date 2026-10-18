@@ -1,6 +1,6 @@
 # Atlas DNS 转发器
 
-Atlas 是一个由 matcher、rule 和 action 组合驱动的 DNS 转发服务。它支持 UDP/TCP、DNS over TLS、DNS over HTTPS、静态 hosts、geosite 分流、策略级缓存、有界的并发故障转移，以及通过签名 TXT 保护代理入口的 bootstrap 解析。
+Atlas 是一个由 matcher、rule 和 action 组合驱动的 DNS 转发服务。它支持 UDP/TCP、DNS over TLS、DNS over HTTPS、静态 hosts、geosite 分流、策略级缓存、响应地址校验与回退，以及通过签名 TXT 保护代理入口的 bootstrap 解析。
 
 默认配置行为偏向安全：DNS 监听地址为 `127.0.0.1:5353`，pprof 为 `127.0.0.1:6060`。如需对外提供递归解析，必须显式修改监听地址，并配合网络 ACL、防火墙和客户端限速。
 
@@ -132,6 +132,71 @@ log:
   level: info
   console: true
 ```
+
+## 转发响应地址校验与 fallback
+
+对于使用国内 DoH 的 forward action，可以允许指定 IP 规则集及内网地址；响应中出现未允许的地址时，丢弃整份响应，直接调用另一个 forward action。下面的配置补充到前面的示例中，域名仍由原有 matcher/rule 分流：
+
+```yaml
+resource:
+  ip_set:
+    - name: cn
+      format: maxmind_mmdb
+      files:
+        - /data/GeoLite2-Country.mmdb
+      countries: [CN]
+
+  action:
+    - name: forward-local
+      type: forward
+      data:
+        server_list:
+          - https://223.5.5.5/dns-query?timeout=1500
+          - https://1.12.12.12/dns-query?timeout=1500
+        parallel: 2
+        validate:
+          ip_sets: [cn]
+        fallback: forward-remote
+
+    - name: forward-remote
+      type: forward
+      data:
+        server_list:
+          - https://1.1.1.1/dns-query?timeout=2500
+        parallel: 1
+```
+
+这里的 `cn` 是集合名称，`countries: [CN]` 指定它包含 GeoIP 中国网段。命中国内域名规则后，先由 `forward-local` 查询；只要响应中任一被检查的地址不属于 CN，就丢弃整份响应并执行 `forward-remote`。此示例没有额外放行内网地址。
+
+`resource.ip_set` 支持两种本地数据格式：
+
+- `format: maxmind_mmdb`：读取 MaxMind 原生的 GeoLite2-Country 或 GeoIP2-Country `.mmdb` 文件，`countries` 必须包含至少一个两字母国家码。多个国家码、多份文件取并集，国家码大小写不敏感。使用记录的 `country.iso_code` 判断地理归属，不使用运营商的 `registered_country` 代替；未知归属和未选中的国家不匹配该集合。`CN` 不隐含包含 `HK`、`MO` 或 `TW`。
+- `format: cidr`（省略 `format` 时的默认值）：一行一个 IPv4/IPv6 CIDR，支持空行和 `#` 注释，包括行尾注释；此格式不配置 `countries`。
+
+从 MaxMind 下载 Country 二进制数据库并解压出 `.mmdb` 文件后，即可直接配置路径，无需自行转换 CSV。Atlas 在启动时校验数据库并将所选国家的 IPv4/IPv6 网段加载为不可变集合，查询期间无需访问数据库文件。更换文件或国家选择后重启生效，程序不自动下载或更新数据。空集合仍然有效；所选国家在数据库中没有网段时，该集合不允许任何地址。
+
+读取失败、损坏或错误类型的数据库、非法 CIDR、重复名称、未定义集合和未知网络类型均阻止启动。单个 MMDB 文件最多 256 MiB，最多遍历 200 万个网段；每个集合最多包含 100 万个不同 CIDR，纯文本单行最多 4096 字节。数据库格式说明见 [MaxMind 文档](https://dev.maxmind.com/geoip/docs/databases/city-and-country/)。
+
+如需额外允许内网等地址，可在 `validate` 下配置 `networks: [private, loopback, link_local, shared]`。可选值如下，其他特殊地址可自行放入 CIDR 集合：
+
+| 名称 | IPv4 | IPv6 |
+| --- | --- | --- |
+| `private` | `10.0.0.0/8`、`172.16.0.0/12`、`192.168.0.0/16` | `fc00::/7` |
+| `loopback` | `127.0.0.0/8` | `::1/128` |
+| `link_local` | `169.254.0.0/16` | `fe80::/10` |
+| `shared` | `100.64.0.0/10` | 无 |
+
+每个地址匹配任一集合或网络即可通过，但响应中所有被检查的地址都必须通过。IPv4-mapped IPv6 地址按 IPv4 判断。只检查 Answer 中的 A、AAAA，以及 HTTPS/SVCB 的 `ipv4hint`、`ipv6hint`；不检查 Authority/Additional。NXDOMAIN、NODATA、纯 CNAME、没有地址提示的 HTTPS/SVCB 等结果继续接受。
+
+`validate` 和 `fallback` 必须同时配置，且至少配置一个集合引用或一个网络名称。`ip_sets` 可省略或为空；引用空集合也有效，只是该集合不允许任何地址。`fallback` 按名称引用已定义的 forward action，与配置顺序无关；多个 action 可共享同一目标，也支持无环的多级回退。未定义目标、指向非 forward action、自引用及循环引用均阻止启动。
+
+上游组仍采用第一个有效 DNS 响应。该结果校验失败后立即转入 fallback，不再尝试同组其他节点，也不拼接两边的记录。只有地址校验失败触发此回退；普通超时、SERVFAIL 等继续沿用上游组原有的错误处理。fallback 直接执行目标 action，不重新匹配域名规则；目标按自己的策略处理，其最终响应不会被来源 action 的地址规则再次拒绝。完整查询及后台刷新各自共用 `server.request_timeout` 的总预算，多级回退不会逐级重置超时。
+
+缓存位于完整策略之外。fallback 成功的结果同时进入来源 action 和目标 action 的缓存，共享现有总容量限制。乐观缓存仍可立即返回 TTL 0 的旧数据，后台刷新执行完整的校验和回退流程；刷新失败不覆盖旧数据，也不延长 `max_stale`。没有可用缓存且最终查询失败时返回 SERVFAIL。hosts 和签名 bootstrap 继续由各自的解析流程处理。
+
+新增或修改 IP 集合（包括格式、国家选择、数据库路径和内容）、`validate`、`fallback` 不自动使已有内存或落盘缓存失效，也不重新验证缓存命中结果。若希望新策略立即影响已有缓存，应先停止服务、删除 `cache.file` 指定的普通 DNS 缓存文件，再启动服务；运行时直接删除文件可能被再次落盘覆盖。其他配置变更仍沿用原有指纹检查，无需为本功能删除 bootstrap 检查点。
+
+这一机制按允许的地址范围筛查结果。正常 CDN 也可能返回境外地址并触发 fallback；日志中的校验失败不代表已证实遭到攻击，规则集遗漏的合法网段也需要自行补充。
 
 ## 签名 TXT bootstrap
 
@@ -295,6 +360,50 @@ legacy.test 192.0.2.20 2001:db8::20
 重复 IP 会去重，静态 hosts 只为 IN class 的 A/AAAA/ANY 查询生成记录。
 
 ## 调试与指标
+
+日志按事件区分级别：
+
+| 级别 | 事件与定位信息 |
+| --- | --- |
+| INFO | bootstrap 初始化、公钥 ID、已接受的签名版本与地址；IP 集合的数据文件、国家选择、网段数量；fallback 成功及最终上游、地址和耗时。 |
+| WARN | TXT 候选验签失败、过期、域名不匹配、未知公钥，以及上游 TXT 查询失败、版本回退或冲突；响应地址校验失败、fallback 失败、后台刷新失败；总处理与写响应耗时达到 1 秒的慢查询。 |
+| DEBUG | 普通查询结果、各上游尝试与获胜者、缓存命中/过期/未命中/绕过、共享查询等待、后台刷新起止，以及已通过验证的 TXT 候选。 |
+
+TXT 候选校验失败会单独记录，即使同次响应或其他上游提供了有效数据，也不会隐藏该失败。日志包含 `domain`、实际查询的 `txt_domain`、`resolver`、`txt_index`、拒绝原因；可解码的公钥标识记为 `candidate_key_id`，已接受记录另有 `key_id`、`issued_at`、`expires_at`。不输出完整 TXT 载荷、签名或私钥；上游 URL 的用户名、密码、查询参数和 fragment 会被移除，外部错误文本有长度上限。
+
+追踪采用 OpenTelemetry，日志统一输出 `trace_id`（32 位十六进制）和 `span_id`（16 位十六进制）。普通父子调用共享 Trace ID，SDK 根据 context 维护父子 Span；DNS 请求、规则执行、转发、上游访问、TXT bootstrap 和 fallback 均有对应 Span。
+
+共享上游查询和后台刷新使用独立 Trace，通过 Span Link 关联发起者；每个等待者还有一个链接到共享任务的等待 Span，任务的取消仍由缓存管理器控制。普通日志通过 `work_trace_id` / `work_span_id` 查找共享任务，通过 `refresh_trace_id` / `refresh_span_id` 查找乐观缓存触发的刷新；刷新任务带 `background: true`。这些字段均来自 SDK 的 SpanContext，不再手工生成 ID 或维护 `parent_traceid`。
+
+fallback 日志包含来源 action、目标 `fallback`、`primary_resolver`、`rejected_ip`、`primary_elapsed_ms`、`fallback_elapsed_ms`、`elapsed_ms`；查询汇总包含最终 `result_resolver`、`result_action`、`ips`、`rcode`、缓存状态和耗时。下面是字段示意（实际日志由现有 logger 输出）：
+
+```json
+{"msg":"forward fallback succeeded","trace_id":"4bf92f3577b34da6a3ce929d0e0e4736","span_id":"00f067aa0ba902b7","domain":"example.cn.","action":"local","fallback":"remote","primary_resolver":"doh:https://223.5.5.5/dns-query","rejected_ip":"203.0.113.10","result_resolver":"doh:https://1.1.1.1/dns-query","primary_elapsed_ms":18,"fallback_elapsed_ms":1240,"elapsed_ms":1258}
+```
+
+新写入的普通 DNS 缓存会同时保存结果来源，并兼容已有缓存文件。`result_via_fallback: true` 表示该数据最初通过回退获得；`fallback_executed: true` 表示本次查询实际执行过回退，缓存命中不会被误报为新回退。超时而尚未拿到共享任务状态时，不输出未确认的 `fallback_executed: false`。旧缓存没有来源元数据时标记 `result_resolver: unknown`；bootstrap 检查点保持现有格式，重启恢复后也不会猜测此前的 TXT 上游。
+
+日常可保留 `log.level: info`，异常和慢查询无需开启 DEBUG。需要追踪每次查询时，将现有配置中的 `log.level` 改为 `debug` 后重启；保留原有文件、轮转和控制台配置。先按域名与时间找到事件，再按 `trace_id`、`span_id` 和共享任务字段关联各阶段。`elapsed_ms`、`proc_ms`、`write_ms` 等带 `_ms` 的字段均为毫秒。
+
+### OpenTelemetry 导出
+
+默认 `OTEL_TRACES_EXPORTER=none`，使用不录制 Span 的 SDK 生成有效的日志关联 ID，不需要追踪后端。`OTEL_TRACES_EXPORTER=console` 可将 Span 以 JSON 输出到标准输出，便于临时验证父子关系、Span Links 和 TXT 验证事件；这独立于业务日志的 `log.console` 设置。
+
+需要向 Collector、Tempo 或 Jaeger 导出时，设置 `OTEL_TRACES_EXPORTER=otlp`，使用 OTLP HTTP/protobuf。例如在 Compose 的 `atlas.environment` 下加入：
+
+```yaml
+environment:
+  OTEL_TRACES_EXPORTER: otlp
+  OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
+  OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
+  OTEL_SERVICE_NAME: atlas
+  OTEL_TRACES_SAMPLER: parentbased_traceidratio
+  OTEL_TRACES_SAMPLER_ARG: "0.1"
+```
+
+SDK 支持标准的 `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`（完整 traces URL）、请求头、超时、资源属性与采样环境变量；仅支持 HTTP/protobuf，其他协议会在启动时报错。启用导出时，未配置采样器采用 SDK 默认的 ParentBased(AlwaysOn)；例如临时验证可设置 `OTEL_TRACES_SAMPLER=always_on`。采样只影响 Span 录制和导出，业务日志及其关联 ID 保持可用。
+
+导出使用 SDK 有界异步队列，队列满时丢弃 Span，导出失败记录 WARN，不阻塞 DNS 查询。退出时先等待查询和刷新任务结束，再在最多 5 秒内关闭导出器。父子关系和 Span Links 由导出后的追踪数据呈现；本地文件日志仍可独立排查。参考 [Go SDK 文档](https://opentelemetry.io/docs/languages/go/instrumentation/) 与 [环境变量说明](https://opentelemetry.io/docs/specs/otel/configuration/sdk-environment-variables/)。
 
 启用 pprof 后可访问：
 

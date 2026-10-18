@@ -1,10 +1,16 @@
 package config
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/xxxsen/atlas/internal/bootstrap"
+	"github.com/xxxsen/atlas/internal/ipset"
 )
 
 const minimalConfig = `
@@ -196,5 +202,108 @@ func TestBootstrapConfigRejectsOldRecordsAndInvalidBounds(t *testing.T) {
 	}
 	if _, err := loadText(t, minimalConfig+"bootstrap: {}\n"); err == nil {
 		t.Fatal("accepted an empty bootstrap configuration")
+	}
+}
+
+func TestValidationPolicyPreservesLegacyFingerprintWithoutMutatingConfig(t *testing.T) {
+	cfg, err := loadText(t, `
+resource:
+  action:
+    - name: cn
+      type: forward
+      data:
+        server_list: ["udp://127.0.0.1:53"]
+        parallel: 1
+    - name: remote
+      type: forward
+      data:
+        server_list: ["udp://127.0.0.2:53"]
+        parallel: 1
+rule:
+  - match: any
+    action: cn
+`+bootstrapConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Reproduce the pre-feature JSON shape, including field order and nulls.
+	legacyResource := struct {
+		Host    HostConfig      `json:"host"`
+		Matcher []MatcherConfig `json:"matcher"`
+		Action  []ActionConfig  `json:"action"`
+	}{cfg.Resource.Host, cfg.Resource.Matcher, cfg.Resource.Action}
+	encoded, err := json.Marshal(struct {
+		Resource  any               `json:"resource"`
+		Rule      []Rule            `json:"rule"`
+		Cache     CacheConfig       `json:"cache"`
+		Bootstrap *bootstrap.Config `json:"bootstrap,omitempty"`
+	}{legacyResource, cfg.Rule, cfg.Cache, cfg.Bootstrap})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(encoded)
+	legacy := hex.EncodeToString(sum[:])
+	before, err := cfg.Fingerprint()
+	if err != nil || before != legacy {
+		t.Fatalf("legacy fingerprint changed: %s != %s (%v)", before, legacy, err)
+	}
+	cfg.Resource.IPSet = []ipset.Config{{Name: "cn", Files: []string{"/new/cn.txt"}}}
+	data := cfg.Resource.Action[0].Data.(map[string]any)
+	data["validate"] = map[string]any{"ip_sets": []string{"cn"}, "networks": []string{"private"}}
+	data["fallback"] = "remote"
+	after, err := cfg.Fingerprint()
+	if err != nil || after != legacy {
+		t.Fatalf("validation policy invalidated old cache: %s != %s (%v)", after, legacy, err)
+	}
+	if _, exists := data["validate"]; !exists || len(cfg.Resource.IPSet) != 1 {
+		t.Fatal("fingerprinting modified live configuration")
+	}
+	data["fallback"] = "another-forward"
+	cfg.Resource.IPSet[0].Files[0] = "/migrated/new-cn.txt"
+	cfg.Resource.IPSet[0].Format = "maxmind_mmdb"
+	cfg.Resource.IPSet[0].Countries = []string{"CN", "HK"}
+	if changed, err := cfg.Fingerprint(); err != nil || changed != legacy {
+		t.Fatalf("fallback/IP file change invalidated cache: %s (%v)", changed, err)
+	}
+	data["server_list"] = []string{"udp://127.0.0.3:53"}
+	if changed, err := cfg.Fingerprint(); err != nil || changed == legacy {
+		t.Fatalf("upstream change failed to invalidate cache: %s (%v)", changed, err)
+	}
+}
+
+func TestIPSetDeclarationsAreStrictButMayBeEmpty(t *testing.T) {
+	for _, declaration := range []string{
+		"    - name: cn\n      file: /cn.txt\n",
+		"    - name: cn\n    - name: cn\n",
+		"    - name: 'bad name'\n",
+		"    - name: cn\n      files: ['']\n",
+		"    - name: cn\n      format: unsupported\n",
+		"    - name: cn\n      format: maxmind_mmdb\n",
+		"    - name: cn\n      countries: [CN]\n",
+		"    - name: cn\n      format: maxmind_mmdb\n      countries: [CHN]\n",
+	} {
+		text := strings.Replace(minimalConfig, "resource:\n", "resource:\n  ip_set:\n"+declaration, 1)
+		if _, err := loadText(t, text); err == nil {
+			t.Errorf("accepted invalid declaration: %s", declaration)
+		}
+	}
+	text := strings.Replace(minimalConfig, "resource:\n", "resource:\n  ip_set:\n    - name: empty\n      files: []\n", 1)
+	if _, err := loadText(t, text); err != nil {
+		t.Fatalf("empty set should be allowed: %v", err)
+	}
+	text = strings.Replace(minimalConfig, "resource:\n", `resource:
+  ip_set:
+    - name: cn
+      format: maxmind_mmdb
+      files: [/data/GeoLite2-Country.mmdb]
+      countries: [CN, HK]
+`, 1)
+	cfg, err := loadText(t, text)
+	if err != nil {
+		t.Fatal(err)
+	}
+	set := cfg.Resource.IPSet[0]
+	if set.Format != "maxmind_mmdb" || len(set.Countries) != 2 || set.Countries[0] != "CN" {
+		t.Fatalf("GeoIP configuration was not preserved: %+v", set)
 	}
 }

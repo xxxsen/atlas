@@ -10,12 +10,15 @@ import (
 	"time"
 
 	"github.com/miekg/dns"
-	"github.com/xxxsen/common/logutil"
+	"github.com/xxxsen/atlas/internal/querylog"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
 )
 
 type groupResolver struct {
 	name       string
+	label      string
 	res        []IDNSResolver
 	concurrent int
 	next       atomic.Uint64
@@ -32,6 +35,7 @@ type groupResult struct {
 	msg      *dns.Msg
 	err      error
 	resolver string
+	elapsed  time.Duration
 }
 
 type groupAttempt struct {
@@ -86,7 +90,7 @@ func (p *groupResolver) buildAttempts(req *dns.Msg) []groupAttempt {
 	return attempts
 }
 
-func (p *groupResolver) Query(ctx context.Context, req *dns.Msg) (*dns.Msg, error) {
+func (p *groupResolver) Query(ctx context.Context, req *dns.Msg) (response *dns.Msg, resultErr error) {
 	if ctx == nil {
 		return nil, fmt.Errorf("group resolver context is nil")
 	}
@@ -96,6 +100,10 @@ func (p *groupResolver) Query(ctx context.Context, req *dns.Msg) (*dns.Msg, erro
 	if req == nil || len(req.Question) != 1 {
 		return nil, fmt.Errorf("group resolver requires exactly one DNS question")
 	}
+	ctx = querylog.WithQuery(ctx, req)
+	ctx, span := querylog.Start(ctx, "resolver.group", trace.WithAttributes(attribute.String("atlas.action", querylog.SafeText(p.label)), attribute.Int("atlas.parallel", p.concurrent)))
+	defer func() { querylog.Finish(ctx, span, resultErr) }()
+	start := time.Now()
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -106,7 +114,7 @@ func (p *groupResolver) Query(ctx context.Context, req *dns.Msg) (*dns.Msg, erro
 		return nil, fmt.Errorf("group resolver %s: %w", p.name, ErrNoAvailableUpstream)
 	}
 
-	logger := logutil.GetLogger(ctx).With(zap.String("resolver", p.name), zap.Int("parallel", p.concurrent))
+	logger := querylog.Logger(ctx).With(zap.String("group", p.name), zap.String("action", p.label), zap.Int("parallel", p.concurrent))
 	resultCh := make(chan groupResult, len(attempts))
 	var workers sync.WaitGroup
 	launch := func(attempt int) {
@@ -114,6 +122,7 @@ func (p *groupResolver) Query(ctx context.Context, req *dns.Msg) (*dns.Msg, erro
 		go func() {
 			defer workers.Done()
 			resolver := attempts[attempt].resolver
+			started := time.Now()
 			msg, err := resolver.Query(ctx, attempts[attempt].request)
 			if err == nil {
 				err = ValidateResponse(attempts[attempt].request, msg)
@@ -124,7 +133,9 @@ func (p *groupResolver) Query(ctx context.Context, req *dns.Msg) (*dns.Msg, erro
 			if err == nil && msg.Truncated {
 				err = fmt.Errorf("upstream returned a truncated response")
 			}
-			resultCh <- groupResult{msg: msg, err: err, resolver: resolver.Name()}
+			name := querylog.SafeText(resolver.Name())
+			logger.Debug("upstream query completed", zap.String("upstream", name), querylog.Elapsed(started), querylog.Error(err), zap.Strings("ips", querylog.IPs(msg)))
+			resultCh <- groupResult{msg: msg, err: err, resolver: name, elapsed: time.Since(started)}
 		}()
 	}
 
@@ -155,11 +166,12 @@ func (p *groupResolver) Query(ctx context.Context, req *dns.Msg) (*dns.Msg, erro
 				}
 				cancel()
 				workers.Wait()
-				logger.Debug("group resolver query succeeded", zap.String("winner", result.resolver))
+				querylog.SetResult(ctx, querylog.Result{Source: "upstream", Resolver: result.resolver, Action: p.label})
+				logger.Debug("group resolver query succeeded", zap.String("winner", result.resolver), querylog.Elapsed(start), zap.Float64("upstream_elapsed_ms", float64(result.elapsed)/float64(time.Millisecond)), zap.Strings("ips", querylog.IPs(result.msg)))
 				return result.msg, nil
 			}
 			if !errors.Is(result.err, context.Canceled) {
-				logger.Debug("group resolver attempt failed", zap.String("child_resolver", result.resolver), zap.Error(result.err))
+				logger.Debug("group resolver attempt failed", zap.String("child_resolver", result.resolver), querylog.Error(result.err))
 				errs = append(errs, fmt.Errorf("%s: %w", result.resolver, result.err))
 			}
 			if next < len(attempts) {
@@ -218,7 +230,7 @@ func NewGroupResolver(name string, res []IDNSResolver, concurrent int) (IDNSReso
 			return nil, fmt.Errorf("group resolver %q child %d is nil", name, i)
 		}
 	}
-	return &groupResolver{name: buildGroupName(name, children, concurrent), res: children, concurrent: concurrent}, nil
+	return &groupResolver{name: buildGroupName(name, children, concurrent), label: name, res: children, concurrent: concurrent}, nil
 }
 
 func buildGroupName(name string, res []IDNSResolver, cc int) string {
