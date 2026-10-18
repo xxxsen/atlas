@@ -12,9 +12,16 @@ import (
 )
 
 type Config struct {
-	Name  string   `json:"name" yaml:"name"`
-	Files []string `json:"files" yaml:"files"`
+	Name      string   `json:"name" yaml:"name"`
+	Files     []string `json:"files" yaml:"files"`
+	Format    string   `json:"format,omitempty" yaml:"format"`
+	Countries []string `json:"countries,omitempty" yaml:"countries"`
 }
+
+const (
+	formatCIDR           = "cidr"
+	formatMaxMindCountry = "maxmind_mmdb"
+)
 
 type ValidationConfig struct {
 	IPSets   []string `json:"ip_sets" yaml:"ip_sets"`
@@ -58,6 +65,23 @@ func Validate(configs []Config) error {
 			return fmt.Errorf("duplicate IP set name %q", name)
 		}
 		seen[name] = true
+		switch configFormat(cfg) {
+		case formatCIDR:
+			if len(cfg.Countries) != 0 {
+				return fmt.Errorf("IP set %q countries requires format: %s", name, formatMaxMindCountry)
+			}
+		case formatMaxMindCountry:
+			if len(cfg.Countries) == 0 {
+				return fmt.Errorf("IP set %q requires at least one country code", name)
+			}
+			for _, country := range cfg.Countries {
+				if _, err := countryCode(country); err != nil {
+					return fmt.Errorf("IP set %q: %w", name, err)
+				}
+			}
+		default:
+			return fmt.Errorf("IP set %q has unknown format %q", name, cfg.Format)
+		}
 		for j, file := range cfg.Files {
 			if strings.TrimSpace(file) == "" {
 				return fmt.Errorf("IP set %q files[%d] is empty", name, j)
@@ -76,7 +100,13 @@ func Load(configs []Config) (*Registry, error) {
 		name := strings.TrimSpace(cfg.Name)
 		set := newPrefixSet()
 		for _, path := range cfg.Files {
-			if err := set.load(strings.TrimSpace(path)); err != nil {
+			var err error
+			if configFormat(cfg) == formatMaxMindCountry {
+				err = set.loadMaxMind(strings.TrimSpace(path), cfg.Countries)
+			} else {
+				err = set.load(strings.TrimSpace(path))
+			}
+			if err != nil {
 				return nil, fmt.Errorf("IP set %q: %w", name, err)
 			}
 		}
@@ -151,19 +181,45 @@ func (s *prefixSet) load(path string) error {
 		if err != nil {
 			return fmt.Errorf("%s:%d: invalid CIDR %q: %w", path, line, text, err)
 		}
-		if prefix.Addr().Is4In6() {
-			if prefix.Bits() < 96 {
-				return fmt.Errorf("%s:%d: IPv4-mapped CIDR must be /96 or longer", path, line)
-			}
-			prefix = netip.PrefixFrom(prefix.Addr().Unmap(), prefix.Bits()-96)
-		}
-		s.prefixes[prefix.Masked()] = struct{}{}
-		if len(s.prefixes) > 1_000_000 {
-			return fmt.Errorf("%s:%d: IP set exceeds 1000000 unique CIDRs", path, line)
+		if err := s.add(prefix); err != nil {
+			return fmt.Errorf("%s:%d: %w", path, line, err)
 		}
 	}
 	if err := scanner.Err(); err != nil {
 		return fmt.Errorf("read %s: %w", path, err)
+	}
+	return nil
+}
+
+func configFormat(cfg Config) string {
+	format := strings.ToLower(strings.TrimSpace(cfg.Format))
+	if format == "" {
+		return formatCIDR
+	}
+	return format
+}
+
+func countryCode(raw string) (string, error) {
+	code := strings.ToUpper(strings.TrimSpace(raw))
+	if len(code) != 2 || code[0] < 'A' || code[0] > 'Z' || code[1] < 'A' || code[1] > 'Z' {
+		return "", fmt.Errorf("invalid country code %q: expected two ASCII letters", raw)
+	}
+	return code, nil
+}
+
+func (s *prefixSet) add(prefix netip.Prefix) error {
+	if !prefix.IsValid() {
+		return fmt.Errorf("invalid CIDR")
+	}
+	if prefix.Addr().Is4In6() {
+		if prefix.Bits() < 96 {
+			return fmt.Errorf("IPv4-mapped CIDR must be /96 or longer")
+		}
+		prefix = netip.PrefixFrom(prefix.Addr().Unmap(), prefix.Bits()-96)
+	}
+	s.prefixes[prefix.Masked()] = struct{}{}
+	if len(s.prefixes) > 1_000_000 {
+		return fmt.Errorf("IP set exceeds 1000000 unique CIDRs")
 	}
 	return nil
 }

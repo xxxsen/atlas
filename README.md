@@ -141,9 +141,10 @@ log:
 resource:
   ip_set:
     - name: cn
+      format: maxmind_mmdb
       files:
-        - /data/ip-rules/cn-v4.txt
-        - /data/ip-rules/cn-v6.txt
+        - /data/GeoLite2-Country.mmdb
+      countries: [CN]
 
   action:
     - name: forward-local
@@ -155,7 +156,6 @@ resource:
         parallel: 2
         validate:
           ip_sets: [cn]
-          networks: [private, loopback, link_local, shared]
         fallback: forward-remote
 
     - name: forward-remote
@@ -166,9 +166,18 @@ resource:
         parallel: 1
 ```
 
-`resource.ip_set` 是具名本地 CIDR 集合，文件一行一个 IPv4/IPv6 CIDR，支持空行和 `#` 注释，包括行尾注释。网段会规范化、去重；文件在启动时加载，修改后重启生效。Atlas 不自动下载、更新或按国家查询这些文件。读取失败、非法 CIDR、重复名称、未定义集合和未知网络类型均阻止启动，并报告对应位置。一个集合最多包含 100 万个不同 CIDR，单行最多 4096 字节。
+这里的 `cn` 是集合名称，`countries: [CN]` 指定它包含 GeoIP 中国网段。命中国内域名规则后，先由 `forward-local` 查询；只要响应中任一被检查的地址不属于 CN，就丢弃整份响应并执行 `forward-remote`。此示例没有额外放行内网地址。
 
-`networks` 可选值如下，其他特殊地址可自行放入 IP 集合：
+`resource.ip_set` 支持两种本地数据格式：
+
+- `format: maxmind_mmdb`：读取 MaxMind 原生的 GeoLite2-Country 或 GeoIP2-Country `.mmdb` 文件，`countries` 必须包含至少一个两字母国家码。多个国家码、多份文件取并集，国家码大小写不敏感。使用记录的 `country.iso_code` 判断地理归属，不使用运营商的 `registered_country` 代替；未知归属和未选中的国家不匹配该集合。`CN` 不隐含包含 `HK`、`MO` 或 `TW`。
+- `format: cidr`（省略 `format` 时的默认值）：一行一个 IPv4/IPv6 CIDR，支持空行和 `#` 注释，包括行尾注释；此格式不配置 `countries`。
+
+从 MaxMind 下载 Country 二进制数据库并解压出 `.mmdb` 文件后，即可直接配置路径，无需自行转换 CSV。Atlas 在启动时校验数据库并将所选国家的 IPv4/IPv6 网段加载为不可变集合，查询期间无需访问数据库文件。更换文件或国家选择后重启生效，程序不自动下载或更新数据。空集合仍然有效；所选国家在数据库中没有网段时，该集合不允许任何地址。
+
+读取失败、损坏或错误类型的数据库、非法 CIDR、重复名称、未定义集合和未知网络类型均阻止启动。单个 MMDB 文件最多 256 MiB，最多遍历 200 万个网段；每个集合最多包含 100 万个不同 CIDR，纯文本单行最多 4096 字节。数据库格式说明见 [MaxMind 文档](https://dev.maxmind.com/geoip/docs/databases/city-and-country/)。
+
+如需额外允许内网等地址，可在 `validate` 下配置 `networks: [private, loopback, link_local, shared]`。可选值如下，其他特殊地址可自行放入 CIDR 集合：
 
 | 名称 | IPv4 | IPv6 |
 | --- | --- | --- |
@@ -185,7 +194,7 @@ resource:
 
 缓存位于完整策略之外。fallback 成功的结果同时进入来源 action 和目标 action 的缓存，共享现有总容量限制。乐观缓存仍可立即返回 TTL 0 的旧数据，后台刷新执行完整的校验和回退流程；刷新失败不覆盖旧数据，也不延长 `max_stale`。没有可用缓存且最终查询失败时返回 SERVFAIL。hosts 和签名 bootstrap 继续由各自的解析流程处理。
 
-新增或修改 IP 集合、`validate`、`fallback` 不自动使已有内存或落盘缓存失效，也不重新验证缓存命中结果。若希望新策略立即影响已有缓存，应先停止服务、删除 `cache.file` 指定的普通 DNS 缓存文件，再启动服务；运行时直接删除文件可能被再次落盘覆盖。其他配置变更仍沿用原有指纹检查，无需为本功能删除 bootstrap 检查点。
+新增或修改 IP 集合（包括格式、国家选择、数据库路径和内容）、`validate`、`fallback` 不自动使已有内存或落盘缓存失效，也不重新验证缓存命中结果。若希望新策略立即影响已有缓存，应先停止服务、删除 `cache.file` 指定的普通 DNS 缓存文件，再启动服务；运行时直接删除文件可能被再次落盘覆盖。其他配置变更仍沿用原有指纹检查，无需为本功能删除 bootstrap 检查点。
 
 这一机制按允许的地址范围筛查结果。正常 CDN 也可能返回境外地址并触发 fallback；日志中的校验失败不代表已证实遭到攻击，规则集遗漏的合法网段也需要自行补充。
 

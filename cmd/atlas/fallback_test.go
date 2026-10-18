@@ -64,13 +64,19 @@ func writeFallbackFile(t *testing.T, path, content string) {
 	}
 }
 
-func TestServerAddressValidationFallbackAndHostsWithRealUpstreams(t *testing.T) {
+func TestServerGeoIPValidationFallbackAndHostsWithRealUpstreams(t *testing.T) {
 	var primaryCalls, fallbackCalls atomic.Int64
 	primary := fallbackUpstream(t, func(req *dns.Msg) *dns.Msg {
 		primaryCalls.Add(1)
 		switch req.Question[0].Name {
 		case "allowed.test.":
-			return fallbackAnswer(req, "192.0.2.1", 60)
+			return fallbackAnswer(req, "111.235.160.1", 60)
+		case "mixed.test.":
+			msg := fallbackAnswer(req, "111.235.160.1", 60)
+			msg.Answer = append(msg.Answer, fallbackAnswer(req, "81.2.69.142", 60).Answer...)
+			return msg
+		case "unknown.test.":
+			return fallbackAnswer(req, "198.51.100.9", 60)
 		case "nxdomain.test.":
 			msg := fallbackAnswer(req, "", 0)
 			msg.Rcode = dns.RcodeNameError
@@ -82,7 +88,7 @@ func TestServerAddressValidationFallbackAndHostsWithRealUpstreams(t *testing.T) 
 			msg.Rcode = dns.RcodeServerFailure
 			return msg
 		default:
-			return fallbackAnswer(req, "198.51.100.9", 60)
+			return fallbackAnswer(req, "81.2.69.142", 60)
 		}
 	})
 	remote := fallbackUpstream(t, func(req *dns.Msg) *dns.Msg {
@@ -94,9 +100,10 @@ func TestServerAddressValidationFallbackAndHostsWithRealUpstreams(t *testing.T) 
 		}
 		return fallbackAnswer(req, "203.0.113.9", 60)
 	})
-	ipFile := filepath.Join(t.TempDir(), "cn.txt")
-	writeFallbackFile(t, ipFile, "192.0.2.0/24\n")
-	sets, err := ipset.Load([]ipset.Config{{Name: "cn", Files: []string{ipFile}}})
+	sets, err := ipset.Load([]ipset.Config{{
+		Name: "cn", Format: "maxmind_mmdb", Countries: []string{"CN"},
+		Files: []string{filepath.Join("..", "..", "internal", "ipset", "testdata", "GeoLite2-Country-Test.mmdb")},
+	}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -158,8 +165,10 @@ func TestServerAddressValidationFallbackAndHostsWithRealUpstreams(t *testing.T) 
 			primary  int64
 			fallback int64
 		}{
-			{"allowed.test.", dns.RcodeSuccess, "192.0.2.1", 1, 0},
+			{"allowed.test.", dns.RcodeSuccess, "111.235.160.1", 1, 0},
 			{"polluted.test.", dns.RcodeSuccess, "203.0.113.9", 1, 1},
+			{"mixed.test.", dns.RcodeSuccess, "203.0.113.9", 1, 1},
+			{"unknown.test.", dns.RcodeSuccess, "203.0.113.9", 1, 1},
 			{"fallback-failure.test.", dns.RcodeServerFailure, "", 1, 1},
 			{"primary-failure.test.", dns.RcodeServerFailure, "", 1, 0},
 			{"nxdomain.test.", dns.RcodeNameError, "", 1, 0},

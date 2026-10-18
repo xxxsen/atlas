@@ -260,6 +260,8 @@ rule:
 	}
 	data["fallback"] = "another-forward"
 	cfg.Resource.IPSet[0].Files[0] = "/migrated/new-cn.txt"
+	cfg.Resource.IPSet[0].Format = "maxmind_mmdb"
+	cfg.Resource.IPSet[0].Countries = []string{"CN", "HK"}
 	if changed, err := cfg.Fingerprint(); err != nil || changed != legacy {
 		t.Fatalf("fallback/IP file change invalidated cache: %s (%v)", changed, err)
 	}
@@ -275,6 +277,10 @@ func TestIPSetDeclarationsAreStrictButMayBeEmpty(t *testing.T) {
 		"    - name: cn\n    - name: cn\n",
 		"    - name: 'bad name'\n",
 		"    - name: cn\n      files: ['']\n",
+		"    - name: cn\n      format: unsupported\n",
+		"    - name: cn\n      format: maxmind_mmdb\n",
+		"    - name: cn\n      countries: [CN]\n",
+		"    - name: cn\n      format: maxmind_mmdb\n      countries: [CHN]\n",
 	} {
 		text := strings.Replace(minimalConfig, "resource:\n", "resource:\n  ip_set:\n"+declaration, 1)
 		if _, err := loadText(t, text); err == nil {
@@ -284,5 +290,20 @@ func TestIPSetDeclarationsAreStrictButMayBeEmpty(t *testing.T) {
 	text := strings.Replace(minimalConfig, "resource:\n", "resource:\n  ip_set:\n    - name: empty\n      files: []\n", 1)
 	if _, err := loadText(t, text); err != nil {
 		t.Fatalf("empty set should be allowed: %v", err)
+	}
+	text = strings.Replace(minimalConfig, "resource:\n", `resource:
+  ip_set:
+    - name: cn
+      format: maxmind_mmdb
+      files: [/data/GeoLite2-Country.mmdb]
+      countries: [CN, HK]
+`, 1)
+	cfg, err := loadText(t, text)
+	if err != nil {
+		t.Fatal(err)
+	}
+	set := cfg.Resource.IPSet[0]
+	if set.Format != "maxmind_mmdb" || len(set.Countries) != 2 || set.Countries[0] != "CN" {
+		t.Fatalf("GeoIP configuration was not preserved: %+v", set)
 	}
 }
