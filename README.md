@@ -6,7 +6,7 @@ Atlas 是一个由 matcher、rule 和 action 组合驱动的 DNS 转发服务。
 
 ## 本地开发
 
-项目提供统一的 Makefile 入口。没有系统 Go 时，脚本会在仓库 `.cache/go-runtime` 安装校验过 SHA-256 的 Go 1.26.9，不修改系统环境。
+项目提供统一的 Makefile 入口。没有系统 Go 时，脚本会在仓库 `.cache/go-runtime` 安装校验过 SHA-256 的 Go 1.26.10，不修改系统环境。
 
 ```bash
 make build       # 构建 bin/atlas
